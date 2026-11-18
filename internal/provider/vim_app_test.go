@@ -293,7 +293,7 @@ func TestAccVimApp_badIcon(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config:      vimAppConfig{name: "Jim", icon: small}.hcl(slack, vim),
-				ExpectError: regexp.MustCompile(`511x511 pixels; Slack takes 512 to 2000 pixels per side`),
+				ExpectError: regexp.MustCompile(`511x511\s+pixels;\s+Slack\s+takes\s+512\s+to\s+2000\s+pixels\s+per\s+side`),
 			},
 		},
 	})
