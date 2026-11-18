@@ -1,5 +1,11 @@
 # Terraform Provider for Slack Apps
 
+> [!NOTE]
+> This is the bookmd fork of [ymm-oss/slackapp](https://github.com/ymm-oss/terraform-provider-slackapp), published as `bookmd/slackapp`.
+> It adds `slackapp_vim_app`, which installs an app with a Slack CLI service token and writes its bot token and signing secret
+> to a Vim vault secret instead of to state. See [docs/resources/vim_app.md](docs/resources/vim_app.md).
+
+
 [![CI](https://github.com/ymm-oss/terraform-provider-slackapp/actions/workflows/ci.yml/badge.svg)](https://github.com/ymm-oss/terraform-provider-slackapp/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/ymm-oss/terraform-provider-slackapp/graph/badge.svg)](https://codecov.io/gh/ymm-oss/terraform-provider-slackapp)
 
