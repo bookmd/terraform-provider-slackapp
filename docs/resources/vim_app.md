@@ -23,7 +23,7 @@ Destroy deletes the app but not the vault secret, since the Vim platform app may
 - `manifest` (String) A JSON app manifest encoded as a string. It has no icon: set `icon_path`. A change that adds bot scopes installs the app again.
 - `vault_secret_name` (String) Name of the vault secret. It must be unique in the account.
 - `vim_account_id` (String) The Vim account whose vault holds the secret.
-- `vim_base_url` (String) Base URL of the Vim backend whose vault holds the secret, such as `https://api.getvim.ai`.
+- `vim_base_url` (String) Base URL of the Vim backend whose vault holds the secret, such as `https://api.getvim.ai`. It is https, or http on `localhost` or `127.0.0.1`.
 
 ### Optional
 

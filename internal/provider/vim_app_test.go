@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+
+	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack"
 )
 
 const vimAppResource = "slackapp_vim_app.test"
@@ -25,12 +28,18 @@ type vimAppConfig struct {
 	scopes    []string
 	icon      string
 	consumers []string
+	// vimBaseURL replaces the fake Vim's URL.
+	vimBaseURL string
 }
 
 func (c vimAppConfig) hcl(slack *fakeSlack, vim *fakeVim) string {
 	icon := "null"
 	if c.icon != "" {
 		icon = fmt.Sprintf("%q", c.icon)
+	}
+	vimBaseURL := vim.baseURL()
+	if c.vimBaseURL != "" {
+		vimBaseURL = c.vimBaseURL
 	}
 
 	return fmt.Sprintf(`
@@ -53,7 +62,7 @@ resource "slackapp_vim_app" "test" {
   vault_secret_name = "slack-app/test"
   vault_consumers   = %s
 }
-`, slack.baseURL(), c.name, c.name, hclList(c.scopes), icon, vim.baseURL(), hclList(c.consumers))
+`, slack.baseURL(), c.name, c.name, hclList(c.scopes), icon, vimBaseURL, hclList(c.consumers))
 }
 
 func hclList(values []string) string {
@@ -459,4 +468,82 @@ func TestAccVimApp_consumersFail(t *testing.T) {
 			},
 		},
 	})
+}
+
+// The platform app's client secret goes only to https, or to http on the
+// loopback host.
+func TestAccVimApp_badVimBaseURL(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+
+	steps := []resource.TestStep{}
+	for _, url := range []string{"http://api.getvim.ai", "https://user:pw@api.getvim.ai", "http://localhost@evil.example"} {
+		steps = append(steps, resource.TestStep{
+			Config:      vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, vimBaseURL: url}.hcl(slack, vim),
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`must\s+be\s+https://\s+with\s+no\s+user\s+info,\s+or\s+http://\s+on\s+localhost\s+or\s+127\.0\.0\.1`),
+		})
+	}
+
+	resource.UnitTest(t, resource.TestCase{ProtoV6ProviderFactories: providerFactories, Steps: steps})
+
+	if slack.appCount() != 0 || len(vim.routes()) != 0 {
+		t.Error("a refused vim_base_url reached Slack or Vim")
+	}
+}
+
+// A 409 to a repeated create may be this apply's own secret, so the app it
+// may hold the credentials of is kept.
+func TestAccVimApp_conflictAfterRetry(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	vim.failNext("POST /api/vault/secrets", http.StatusTooManyRequests, http.StatusConflict)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      vimAppConfig{name: "Jim", scopes: []string{"chat:write"}}.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`The vault secret may hold this Slack app's credentials`),
+			},
+		},
+	})
+
+	if slack.appCount() != 1 {
+		t.Errorf("%d apps, want the app kept", slack.appCount())
+	}
+}
+
+// A recreate that lands in another workspace is refused: the secret keeps
+// the credentials of the original app, and the new app is deleted.
+func TestAccVimApp_recreateInAnotherWorkspace(t *testing.T) {
+	providerUnsetEnvironment(t)
+	fake, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(fake, vim)},
+			{
+				PreConfig: func() {
+					_, err := applicationResourceSlackClient(fake).AppsManifestDelete(t.Context(),
+						slack.AppsManifestDeleteRequest{AppID: fakeSlackAppID(1)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					fake.moveTeam("T2")
+				},
+				Config:      config.hcl(fake, vim),
+				ExpectError: regexp.MustCompile(`The Slack app would move to another workspace`),
+			},
+		},
+	})
+
+	if fake.appCount() != 0 {
+		t.Error("the app created in the other workspace was kept")
+	}
+	if _, secret := vim.secret("slack-app/test"); secret == nil || secret.fields["botToken"] != fakeSlackBotToken(fakeSlackAppID(1)) {
+		t.Error("the vault secret no longer holds the original app's credentials")
+	}
 }

@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -15,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
@@ -29,7 +33,14 @@ const (
 	vimAppBotTokenField      = "botToken"
 	vimAppSigningSecretField = "signingSecret"
 	vimAppSecretAuthKind     = "custom"
+	// vimAppDeleteTimeout bounds deleting an abandoned app, which runs even
+	// when the apply is cancelled.
+	vimAppDeleteTimeout = 30 * time.Second
 )
+
+// vimAppBaseURLPattern admits https with no user info, and http only on the
+// loopback host: the platform app's client secret is sent to this URL.
+var vimAppBaseURLPattern = regexp.MustCompile(`^(https://[^/?#@\s]+|http://(localhost|127\.0\.0\.1)(:[0-9]+)?)(/[^@\s]*)?$`)
 
 type vimAppResourceModel struct {
 	Manifest        manifesttype.Manifest `tfsdk:"manifest"`
@@ -63,8 +74,10 @@ func (m vimAppResourceModel) consumers(ctx context.Context, diagnostics *diag.Di
 	return consumers
 }
 
+//declscope:shared // vim_app_delete_test.go deletes an abandoned app directly
 type vimAppResource struct {
 	slack *slack.Client
+	//declscope:private
 	vault *vault.Client
 }
 
@@ -103,9 +116,12 @@ func (r *vimAppResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 			},
 			"vim_base_url": schema.StringAttribute{
-				MarkdownDescription: "Base URL of the Vim backend whose vault holds the secret, such as `https://api.getvim.ai`.",
-				Required:            true,
-				PlanModifiers:       replace,
+				MarkdownDescription: "Base URL of the Vim backend whose vault holds the secret, such as `https://api.getvim.ai`. " +
+					"It is https, or http on `localhost` or `127.0.0.1`.",
+				Required:      true,
+				PlanModifiers: replace,
+				Validators: []validator.String{stringvalidator.RegexMatches(vimAppBaseURLPattern,
+					"must be https:// with no user info, or http:// on localhost or 127.0.0.1")},
 			},
 			"vim_account_id": schema.StringAttribute{
 				MarkdownDescription: "The Vim account whose vault holds the secret.",
@@ -337,7 +353,15 @@ func (r *vimAppResource) createAndInstall(ctx context.Context, manifest string, 
 
 // deleteAbandonedApp deletes an app whose credentials did not reach the
 // vault, so that the next apply creates it again from the start.
+//
+// It runs on its own deadline, past a cancelled apply, since the app holds
+// live credentials.
+//
+//declscope:shared // vim_app_delete_test.go cancels the context first
 func (r *vimAppResource) deleteAbandonedApp(ctx context.Context, appID string, diagnostics *diag.Diagnostics) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vimAppDeleteTimeout)
+	defer cancel()
+
 	_, err := r.slack.AppsManifestDelete(ctx, slack.AppsManifestDeleteRequest{AppID: appID})
 	if err == nil || slack.IsAppNotFoundError(err) {
 		tflog.Warn(ctx, "Deleted the Slack app, whose credentials did not reach the vault", map[string]any{"app_id": appID})
@@ -420,10 +444,20 @@ func (r *vimAppResource) Create(ctx context.Context, request resource.CreateRequ
 		Consumers: consumers,
 	})
 	if err != nil {
+		name := data.VaultSecretName.ValueString()
+		if vault.IsConflictAfterRetry(err) {
+			response.Diagnostics.AddError("The vault secret may hold this Slack app's credentials",
+				fmt.Sprintf("Vim answered 409 to a repeated create of secret %q, so an earlier attempt may have written it "+
+					"with the credentials of app %s. The app is kept. Either delete the secret in Vim and app %s at "+
+					"https://api.slack.com/apps, then apply again; or keep both and adopt them by hand. (%s)",
+					name, app.appID, app.appID, err))
+
+			return
+		}
+
 		detail := err.Error()
 		if vault.IsConflict(err) {
-			detail = fmt.Sprintf("The Vim account already has a secret named %q. Delete it in Vim, then apply again. (%s)",
-				data.VaultSecretName.ValueString(), err)
+			detail = fmt.Sprintf("The Vim account already has a secret named %q. Delete it in Vim, then apply again. (%s)", name, err)
 		}
 		response.Diagnostics.AddError("Failed to write the Slack app's credentials to the vault", detail)
 		r.deleteAbandonedApp(ctx, app.appID, &response.Diagnostics)
@@ -497,7 +531,7 @@ func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequ
 	}
 
 	if state.ID.IsNull() {
-		r.recreate(ctx, &plan, &response.Diagnostics)
+		r.recreate(ctx, &plan, state.TeamID.ValueString(), &response.Diagnostics)
 	} else {
 		r.updateInPlace(ctx, state, &plan, &response.Diagnostics)
 	}
@@ -519,11 +553,23 @@ func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequ
 	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
 }
 
-// recreate creates again an app deleted in Slack, and writes its new
-// credentials to the secret the old one used, so its consumers follow.
-func (r *vimAppResource) recreate(ctx context.Context, plan *vimAppResourceModel, diagnostics *diag.Diagnostics) {
+// recreate creates again an app deleted in Slack, in the workspace that
+// held it, and writes its new credentials to the secret the old one used, so
+// its consumers follow.
+func (r *vimAppResource) recreate(ctx context.Context, plan *vimAppResourceModel, teamID string, diagnostics *diag.Diagnostics) {
 	app, ok := r.createAndInstall(ctx, plan.Manifest.ValueString(), diagnostics)
 	if !ok {
+		return
+	}
+
+	if app.identity.TeamID != teamID {
+		diagnostics.AddError("The Slack app would move to another workspace",
+			fmt.Sprintf("The app being replaced was in workspace %s, but the service token created the new one in %s. "+
+				"Vault secret %s is left as it is. Use a service token for workspace %s; "+
+				"if the app it held still exists there, it is not gone.",
+				teamID, app.identity.TeamID, plan.VaultSecretToken.ValueString(), teamID))
+		r.deleteAbandonedApp(ctx, app.appID, diagnostics)
+
 		return
 	}
 

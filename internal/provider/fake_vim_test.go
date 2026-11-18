@@ -30,6 +30,8 @@ type fakeVim struct {
 	calls []string
 	//declscope:private
 	failures map[string]int
+	//declscope:private
+	queued map[string][]int
 }
 
 type fakeVimSecret struct {
@@ -44,7 +46,7 @@ type fakeVimSecret struct {
 func newFakeVim(t *testing.T) *fakeVim {
 	t.Helper()
 
-	f := &fakeVim{secrets: map[string]*fakeVimSecret{}, failures: map[string]int{}}
+	f := &fakeVim{secrets: map[string]*fakeVimSecret{}, failures: map[string]int{}, queued: map[string][]int{}}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(f.server.Close)
 
@@ -65,6 +67,17 @@ func (f *fakeVim) failWith(route string, status int) {
 	defer f.mu.Unlock()
 
 	f.failures[route] = status
+}
+
+// failNext makes the next calls of route answer statuses, one each, the
+// 429s with a Retry-After header.
+//
+//declscope:shared
+func (f *fakeVim) failNext(route string, statuses ...int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.queued[route] = append(f.queued[route], statuses...)
 }
 
 //declscope:shared
@@ -139,7 +152,14 @@ func (f *fakeVim) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.calls = append(f.calls, generic)
 
-	if status, ok := f.failures[generic]; ok {
+	status, ok := f.failures[generic]
+	if queued := f.queued[generic]; len(queued) > 0 {
+		status, ok, f.queued[generic] = queued[0], true, queued[1:]
+	}
+	if ok {
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "0")
+		}
 		w.WriteHeader(status)
 		_, _ = fmt.Fprint(w, `{"error":"failed"}`)
 

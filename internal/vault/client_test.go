@@ -33,6 +33,8 @@ type fakeVim struct {
 	calls    []call
 	minted   int
 	statuses map[string][]int
+	// retryAfter makes every failure answer carry a Retry-After header.
+	retryAfter bool
 }
 
 func newFakeVim(t *testing.T) *fakeVim {
@@ -53,13 +55,16 @@ func newFakeVim(t *testing.T) *fakeVim {
 		if r.URL.Path == "/app-auth/token" && status == http.StatusOK {
 			f.minted++
 		}
-		minted := f.minted
+		minted, retryAfter := f.minted, f.retryAfter
 		f.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 
 		switch {
 		case status >= 400:
+			if retryAfter {
+				w.Header().Set("Retry-After", "0")
+			}
 			w.WriteHeader(status)
 			_, _ = fmt.Fprintf(w, `{"error":"Conflict","message":"failed with %d"}`, status)
 		case r.URL.Path == "/app-auth/token":
@@ -187,6 +192,9 @@ func TestRetriesWhatVimDidNotTake(t *testing.T) {
 	t.Parallel()
 
 	f := newFakeVim(t)
+	f.mu.Lock()
+	f.retryAfter = true
+	f.mu.Unlock()
 	f.failNext(http.MethodPost, "/api/vault/secrets", http.StatusServiceUnavailable, http.StatusTooManyRequests)
 
 	if _, err := client().CreateSecret(t.Context(), f.target(), vault.CreateSecretRequest{Name: "n", AuthKind: "custom", Fields: vault.Fields{"a": "b"}}); err != nil {
@@ -298,5 +306,145 @@ func TestLogsNoSecrets(t *testing.T) {
 	}
 	if s := fmt.Sprint(vault.Fields{"a": "b"}); s != "[redacted]" {
 		t.Errorf("fields print as %q", s)
+	}
+}
+
+func createRequest() vault.CreateSecretRequest {
+	return vault.CreateSecretRequest{Name: "n", AuthKind: "custom", Fields: vault.Fields{"a": "b"}}
+}
+
+// A create Vim may have taken is not sent again: a second create of a secret
+// that did land answers 409.
+func TestCreateIsNotRepeatedWhenVimMayHaveTakenIt(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		f := newFakeVim(t)
+		f.failNext(http.MethodPost, "/api/vault/secrets", status)
+
+		if _, err := client().CreateSecret(t.Context(), f.target(), createRequest()); err == nil {
+			t.Fatalf("HTTP %d: create succeeded", status)
+		}
+		if n := len(f.recorded()); n != 2 {
+			t.Errorf("HTTP %d: %d calls, want 2: a token and one create", status, n)
+		}
+	}
+}
+
+func TestConflictAfterRetry(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeVim(t)
+	f.failNext(http.MethodPost, "/api/vault/secrets", http.StatusTooManyRequests, http.StatusConflict)
+
+	_, err := client().CreateSecret(t.Context(), f.target(), createRequest())
+	if !vault.IsConflictAfterRetry(err) || !vault.IsConflict(err) {
+		t.Fatalf("error %v, want a conflict after a retry", err)
+	}
+
+	f = newFakeVim(t)
+	f.failNext(http.MethodPost, "/api/vault/secrets", http.StatusConflict)
+
+	if _, err := client().CreateSecret(t.Context(), f.target(), createRequest()); vault.IsConflictAfterRetry(err) {
+		t.Errorf("a first-attempt conflict %v reads as one after a retry", err)
+	}
+}
+
+// fakeVimServing answers the token mint, and every vault write with serve.
+func fakeVimServing(t *testing.T, serve http.HandlerFunc) (vault.Target, func() int) {
+	t.Helper()
+
+	var mu sync.Mutex
+	writes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app-auth/token" {
+			_, _ = fmt.Fprint(w, `{"access_token":"access","expires_in":3600}`)
+
+			return
+		}
+		mu.Lock()
+		writes++
+		mu.Unlock()
+		serve(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	return vault.Target{BaseURL: server.URL, AccountID: "acc-1"}, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return writes
+	}
+}
+
+func TestCreateIsNotRepeatedAfterANetworkFailure(t *testing.T) {
+	t.Parallel()
+
+	target, writes := fakeVimServing(t, func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test server cannot drop a connection")
+
+			return
+		}
+		if connection, _, err := hijacker.Hijack(); err == nil {
+			_ = connection.Close()
+		}
+	})
+
+	if _, err := client().CreateSecret(t.Context(), target, createRequest()); err == nil {
+		t.Fatal("create succeeded")
+	}
+	if n := writes(); n != 1 {
+		t.Errorf("%d creates, want 1", n)
+	}
+}
+
+// A success answer that is not a secret means Vim took the write.
+func TestUnreadableSuccessIsNotRepeated(t *testing.T) {
+	t.Parallel()
+
+	target, writes := fakeVimServing(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "not json")
+	})
+	c := client()
+
+	if _, err := c.CreateSecret(t.Context(), target, createRequest()); err == nil || !strings.Contains(err.Error(), "not a secret") {
+		t.Fatalf("create error %v", err)
+	}
+	if _, err := c.RotateSecret(t.Context(), target, testToken, vault.RotateSecretRequest{AuthKind: "custom", Fields: vault.Fields{"a": "b"}}); err == nil {
+		t.Fatal("rotate succeeded")
+	}
+	if n := writes(); n != 2 {
+		t.Errorf("%d writes, want 2: one create and one rotate", n)
+	}
+}
+
+// The client credentials and the access token never follow a redirect.
+func TestDoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+
+	elsewhere := newFakeVim(t)
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirecting.Close)
+
+	_, err := client().SetConsumers(t.Context(), vault.Target{BaseURL: redirecting.URL, AccountID: "acc-1"}, testToken, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+		t.Fatalf("error %v, want HTTP 307", err)
+	}
+	if n := len(elsewhere.recorded()); n != 0 {
+		t.Errorf("the redirect target got %d calls", n)
+	}
+
+	target, _ := fakeVimServing(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	if _, err := client().RotateSecret(t.Context(), target, testToken, vault.RotateSecretRequest{AuthKind: "custom", Fields: vault.Fields{"a": "b"}}); err == nil {
+		t.Fatal("rotate followed a redirect")
+	}
+	if n := len(elsewhere.recorded()); n != 0 {
+		t.Errorf("the redirect target got %d calls", n)
 	}
 }

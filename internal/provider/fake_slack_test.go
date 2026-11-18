@@ -48,6 +48,8 @@ type fakeSlack struct {
 	icons map[string][]string
 	//declscope:private
 	iconSets int
+	//declscope:private
+	team string
 }
 
 // fakeSlackAppID is the ID the fake gives the nth app it creates, counting
@@ -71,6 +73,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		usedRefreshTokens: map[string]bool{},
 		installs:          map[string]int{},
 		icons:             map[string][]string{},
+		team:              "T1",
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(f.server.Close)
@@ -399,7 +402,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.reply(w, map[string]any{"ok": true, "api_access_tokens": map[string]any{"bot": fakeSlackBotToken(body.AppID)}})
 	case "auth.test":
 		appID := strings.TrimPrefix(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), "xoxb-")
-		f.reply(w, map[string]any{"ok": true, "team_id": "T1", "user_id": "U" + appID, "bot_id": "B" + appID})
+		f.reply(w, map[string]any{"ok": true, "team_id": f.team, "user_id": "U" + appID, "bot_id": "B" + appID})
 	case "apps.manifest.delete":
 		if _, ok := f.apps[body.AppID]; !ok {
 			f.reply(w, map[string]any{"ok": false, "error": "app_not_found"})
@@ -489,6 +492,16 @@ func (f *fakeSlack) iconsSet(appID string) []string {
 	defer f.mu.Unlock()
 
 	return append([]string(nil), f.icons[appID]...)
+}
+
+// moveTeam makes later apps belong to workspace team.
+//
+//declscope:shared // vim_app_test.go moves the service token to another workspace
+func (f *fakeSlack) moveTeam(team string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.team = team
 }
 
 // changeIcon changes the URL bots.info serves, as someone changing the

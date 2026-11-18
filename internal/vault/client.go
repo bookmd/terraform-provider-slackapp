@@ -60,10 +60,16 @@ func NewClient(clientID, clientSecret string) *Client {
 	return &Client{
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		httpClient:   http.DefaultClient,
+		httpClient:   &http.Client{CheckRedirect: refuseRedirect},
 		retryWait:    2 * time.Second,
 		tokens:       map[Target]accessToken{},
 	}
+}
+
+// refuseRedirect keeps the client credentials and the bearer token from
+// following a redirect to another host.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // WithRetryWait sets the wait before a write is sent again, as the tests do
@@ -79,6 +85,8 @@ type StatusError struct {
 	Operation string
 	Status    int
 	Message   string
+	// RetryAfter is whether Vim sent a Retry-After header.
+	RetryAfter bool
 }
 
 func (e *StatusError) Error() string {
@@ -96,6 +104,23 @@ func IsConflict(err error) bool {
 
 	return errors.As(err, &statusErr) && statusErr.Status == http.StatusConflict
 }
+
+// IsConflictAfterRetry reports whether err is a create that Vim answered
+// 409 after an earlier attempt of the same create. The earlier attempt may
+// have written the secret, so the secret may hold this call's values.
+func IsConflictAfterRetry(err error) bool {
+	return errors.Is(err, errConflictAfterRetry)
+}
+
+var errConflictAfterRetry = errors.New("an earlier attempt of this create may have written the secret")
+
+// decodeError is a success answer whose body is not a secret. Vim took the
+// write, so it is never sent again.
+type decodeError struct{ err error }
+
+func (e *decodeError) Error() string { return e.err.Error() }
+
+func (e *decodeError) Unwrap() error { return e.err }
 
 // Secret is what Vim returns for a secret it wrote: its name, the names of
 // its fields and its consumers. Never a value.
@@ -121,13 +146,15 @@ type CreateSecretRequest struct {
 }
 
 // CreateSecret creates a named secret. Vim answers 409 when the account
-// already has a secret of that name.
+// already has a secret of that name. It is sent again only when Vim says it
+// did not take it, since a repeated create cannot tell its own secret from
+// another's.
 func (c *Client) CreateSecret(ctx context.Context, target Target, request CreateSecretRequest) (*Secret, error) {
 	if request.Consumers == nil {
 		request.Consumers = []string{}
 	}
 
-	return c.write(ctx, target, "create secret", http.MethodPost, "/api/vault/secrets", request)
+	return c.write(ctx, target, "create secret", http.MethodPost, "/api/vault/secrets", request, createRetryable)
 }
 
 type RotateSecretRequest struct {
@@ -137,7 +164,7 @@ type RotateSecretRequest struct {
 
 // RotateSecret replaces every field of the secret.
 func (c *Client) RotateSecret(ctx context.Context, target Target, token string, request RotateSecretRequest) (*Secret, error) {
-	return c.write(ctx, target, "rotate secret", http.MethodPatch, "/api/vault/secrets/"+token, request)
+	return c.write(ctx, target, "rotate secret", http.MethodPatch, "/api/vault/secrets/"+token, request, idempotentRetryable)
 }
 
 // SetConsumers replaces the services the secret is shared with.
@@ -147,12 +174,14 @@ func (c *Client) SetConsumers(ctx context.Context, target Target, token string, 
 	}
 
 	return c.write(ctx, target, "set secret consumers", http.MethodPut, "/api/vault/secrets/"+token+"/consumers",
-		map[string][]string{"consumers": consumers})
+		map[string][]string{"consumers": consumers}, idempotentRetryable)
 }
 
-// write sends one vault write, and sends it again after a network failure or
-// an answer that says Vim did not take it: 429 or 5xx.
-func (c *Client) write(ctx context.Context, target Target, operation, method, path string, request any) (*Secret, error) {
+// write sends one vault write, and sends it again while retryable says the
+// failure may be repeated.
+func (c *Client) write(ctx context.Context, target Target, operation, method, path string, request any,
+	retryable func(error) bool,
+) (*Secret, error) {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
@@ -171,6 +200,9 @@ func (c *Client) write(ctx context.Context, target Target, operation, method, pa
 
 		var secret *Secret
 		secret, lastErr = c.writeOnce(ctx, target, operation, method, path, body)
+		if attempt > 1 && IsConflict(lastErr) {
+			return nil, fmt.Errorf("%w: %w", errConflictAfterRetry, lastErr)
+		}
 		if lastErr == nil || !retryable(lastErr) {
 			return secret, lastErr
 		}
@@ -179,13 +211,32 @@ func (c *Client) write(ctx context.Context, target Target, operation, method, pa
 	return nil, lastErr
 }
 
-func retryable(err error) bool {
+// idempotentRetryable repeats a write that leaves the same secret however
+// often Vim applies it: after a network failure, 429 or 5xx.
+func idempotentRetryable(err error) bool {
+	var decodeErr *decodeError
+	if errors.As(err, &decodeErr) {
+		return false
+	}
+
 	var statusErr *StatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.Status == http.StatusTooManyRequests || statusErr.Status >= http.StatusInternalServerError
 	}
 
 	return true
+}
+
+// createRetryable repeats a create only when Vim says it did not take it: a
+// create that did land and is sent again answers 409.
+func createRetryable(err error) bool {
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+
+	return statusErr.Status == http.StatusTooManyRequests ||
+		(statusErr.Status == http.StatusServiceUnavailable && statusErr.RetryAfter)
 }
 
 func (c *Client) writeOnce(ctx context.Context, target Target, operation, method, path string, body []byte) (*Secret, error) {
@@ -218,12 +269,15 @@ func (c *Client) writeOnce(ctx context.Context, target Target, operation, method
 	}
 
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return nil, &StatusError{Operation: operation, Status: httpResponse.StatusCode, Message: errorMessage(responseBody)}
+		return nil, &StatusError{
+			Operation: operation, Status: httpResponse.StatusCode, Message: errorMessage(responseBody),
+			RetryAfter: httpResponse.Header.Get("Retry-After") != "",
+		}
 	}
 
 	var secret Secret
 	if err := json.Unmarshal(responseBody, &secret); err != nil {
-		return nil, fmt.Errorf("%s: Vim answered HTTP %d with a body that is not a secret: %w", operation, httpResponse.StatusCode, err)
+		return nil, &decodeError{fmt.Errorf("%s: Vim answered HTTP %d with a body that is not a secret: %w", operation, httpResponse.StatusCode, err)}
 	}
 
 	tflog.Debug(ctx, "Vim wrote the vault secret", map[string]any{
