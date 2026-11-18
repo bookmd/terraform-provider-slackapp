@@ -2,8 +2,11 @@ package provider_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,6 +42,12 @@ type fakeSlack struct {
 	refreshTokens []string
 	//declscope:private
 	usedRefreshTokens map[string]bool
+	//declscope:private
+	installs map[string]int
+	//declscope:private
+	icons map[string][]string
+	//declscope:private
+	iconSets int
 }
 
 // fakeSlackAppID is the ID the fake gives the nth app it creates, counting
@@ -60,6 +69,8 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		authorizations: map[string]string{},
 
 		usedRefreshTokens: map[string]bool{},
+		installs:          map[string]int{},
+		icons:             map[string][]string{},
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(f.server.Close)
@@ -307,6 +318,13 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// These methods take a form, not JSON.
+	if method == "apps.icon.set" || method == "bots.info" {
+		f.serveForm(w, r, method)
+
+		return
+	}
+
 	var body struct {
 		AppID    string `json:"app_id"`
 		Manifest string `json:"manifest"`
@@ -341,7 +359,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				"client_id":          "client-" + appID,
 				"client_secret":      "secret-" + appID,
 				"verification_token": "verification-" + appID,
-				"signing_secret":     "signing-" + appID,
+				"signing_secret":     fakeSlackSigningSecret(appID),
 			},
 			"oauth_authorize_url": "https://slack.com/oauth/v2/authorize?client_id=client-" + appID,
 		})
@@ -351,8 +369,9 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+		permissionsUpdated := fakeSlackBotScopes(f.apps[body.AppID]) != fakeSlackBotScopes(json.RawMessage(body.Manifest))
 		f.apps[body.AppID] = json.RawMessage(body.Manifest)
-		f.reply(w, map[string]any{"ok": true, "app_id": body.AppID, "permissions_updated": false})
+		f.reply(w, map[string]any{"ok": true, "app_id": body.AppID, "permissions_updated": permissionsUpdated})
 	case "apps.manifest.export":
 		m, ok := f.apps[body.AppID]
 		if !ok {
@@ -370,6 +389,17 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			m = rewritten
 		}
 		f.reply(w, map[string]any{"ok": true, "manifest": m})
+	case "apps.developerInstall":
+		if _, ok := f.apps[body.AppID]; !ok {
+			f.reply(w, map[string]any{"ok": false, "error": "app_not_found"})
+
+			return
+		}
+		f.installs[body.AppID]++
+		f.reply(w, map[string]any{"ok": true, "api_access_tokens": map[string]any{"bot": fakeSlackBotToken(body.AppID)}})
+	case "auth.test":
+		appID := strings.TrimPrefix(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), "xoxb-")
+		f.reply(w, map[string]any{"ok": true, "team_id": "T1", "user_id": "U" + appID, "bot_id": "B" + appID})
 	case "apps.manifest.delete":
 		if _, ok := f.apps[body.AppID]; !ok {
 			f.reply(w, map[string]any{"ok": false, "error": "app_not_found"})
@@ -381,6 +411,95 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		f.reply(w, map[string]any{"ok": false, "error": "unknown_method"})
 	}
+}
+
+// fakeSlackBotScopes is the manifest's bot scopes, as one string.
+func fakeSlackBotScopes(manifest json.RawMessage) string {
+	var m struct {
+		OauthConfig struct {
+			Scopes struct {
+				Bot []string `json:"bot"`
+			} `json:"scopes"`
+		} `json:"oauth_config"`
+	}
+	_ = json.Unmarshal(manifest, &m)
+
+	return strings.Join(m.OauthConfig.Scopes.Bot, ",")
+}
+
+// fakeSlackBotToken is the bot token the fake gives an app on every install.
+//
+//declscope:shared // vim_app_test.go checks state never holds it
+func fakeSlackBotToken(appID string) string {
+	return "xoxb-" + appID
+}
+
+// fakeSlackSigningSecret is the signing secret the fake gives an app.
+//
+//declscope:shared // vim_app_test.go checks state never holds it
+func fakeSlackSigningSecret(appID string) string {
+	return "signing-" + appID
+}
+
+// serveForm answers apps.icon.set, keeping each image an app is given, and
+// bots.info, which serves a URL per image set.
+func (f *fakeSlack) serveForm(w http.ResponseWriter, r *http.Request, method string) {
+	if err := r.ParseMultipartForm(1 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+		f.reply(w, map[string]any{"ok": false, "error": "invalid_form"})
+
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls[method]++
+	if failure, ok := f.failures[method]; ok {
+		f.reply(w, failure)
+
+		return
+	}
+
+	switch method {
+	case "apps.icon.set":
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			f.reply(w, map[string]any{"ok": false, "error": "no_file"})
+
+			return
+		}
+		data, _ := io.ReadAll(file)
+		appID := r.FormValue("app_id")
+		f.iconSets++
+		f.icons[appID] = append(f.icons[appID], fmt.Sprintf("%x", sha256.Sum256(data)))
+		f.reply(w, map[string]any{"ok": true})
+	default:
+		appID := strings.TrimPrefix(r.PostFormValue("bot"), "B")
+		f.reply(w, map[string]any{"ok": true, "bot": map[string]any{"icons": map[string]any{
+			"image_72": fmt.Sprintf("https://icons.example/%s/%d.png", appID, f.iconSets),
+		}}})
+	}
+}
+
+// iconsSet returns the SHA-256 of each image set as the app's icon, in order.
+//
+//declscope:shared // vim_app_test.go checks icons are set only on change
+func (f *fakeSlack) iconsSet(appID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.icons[appID]...)
+}
+
+// changeIcon changes the URL bots.info serves, as someone changing the
+// icon in Slack's settings would.
+//
+//declscope:shared // vim_app_test.go checks the change shows as drift
+func (f *fakeSlack) changeIcon() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.iconSets += 1000
 }
 
 func (f *fakeSlack) reply(w http.ResponseWriter, v any) {

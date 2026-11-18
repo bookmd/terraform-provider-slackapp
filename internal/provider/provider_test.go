@@ -29,12 +29,15 @@ var providerFactories = map[string]func() (tfprotov6.ProviderServer, error){
 
 // providerUnsetEnvironment clears the variables the provider falls back to,
 // so that a developer's shell does not change what a test sees.
+//
+//declscope:shared
 func providerUnsetEnvironment(t *testing.T) {
 	t.Helper()
 
 	for _, name := range []string{
 		"SLACK_APP_CONFIGURATION_TOKEN", "SLACK_REFRESH_TOKEN", "SLACK_BASE_URL",
-		"SLACK_TOKEN_STORE_FILE", "SLACK_TOKEN_STORE_COMMAND",
+		"SLACK_TOKEN_STORE_FILE", "SLACK_TOKEN_STORE_COMMAND", "SLACK_SERVICE_TOKEN",
+		"VIM_CLIENT_ID", "VIM_CLIENT_SECRET",
 	} {
 		t.Setenv(name, "")
 	}
@@ -73,7 +76,7 @@ func TestAccProvider_noToken(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config:      providerResource(""),
-				ExpectError: regexp.MustCompile(`either app configuration token, refresh token or token\s+store must be provided`),
+				ExpectError: regexp.MustCompile(`either service token, app configuration token, refresh token or\s+token\s+store\s+must be provided`),
 			},
 		},
 	})

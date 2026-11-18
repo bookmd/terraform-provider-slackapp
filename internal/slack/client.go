@@ -7,13 +7,22 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack/tokens"
 )
 
-const clientDefaultBaseURL = "https://slack.com/api/"
+const (
+	clientDefaultBaseURL = "https://slack.com/api/"
+	// clientDefaultRetryWait is Slack's own Retry-After for the app
+	// management methods.
+	clientDefaultRetryWait = time.Minute
+	// clientMaxAttempts bounds the calls of one method that HTTP 429 causes.
+	clientMaxAttempts = 4
+)
 
 // Client calls Slack's API methods. It builds and sends the requests; its
 // tokens.Source decides which app configuration token each one carries,
@@ -25,6 +34,13 @@ type Client struct {
 	tokens *tokens.Source
 
 	baseURL string
+	// serviceToken, when set, authenticates every call in place of the
+	// rotating app configuration token.
+	//declscope:shared
+	serviceToken tokens.AppConfigurationToken
+	// retryWait is how long a call waits after HTTP 429 when Slack sends no
+	// Retry-After.
+	retryWait time.Duration
 }
 
 // NewClient returns a client with no token. Give it at least one of an app
@@ -33,6 +49,7 @@ func NewClient() *Client {
 	c := &Client{
 		baseURL:    clientDefaultBaseURL,
 		httpClient: http.DefaultClient,
+		retryWait:  clientDefaultRetryWait,
 	}
 	c.tokens = tokens.NewSource(c.rotateTokens)
 
@@ -43,6 +60,22 @@ func NewClient() *Client {
 // tests do against a fake.
 func (c *Client) WithBaseURL(baseURL string) *Client {
 	c.baseURL = baseURL
+
+	return c
+}
+
+// WithServiceToken makes the client call every method with token, a Slack
+// CLI service token. It does not expire and is never rotated.
+func (c *Client) WithServiceToken(token tokens.AppConfigurationToken) *Client {
+	c.serviceToken = token
+
+	return c
+}
+
+// WithRetryWait sets how long a call waits after HTTP 429 when Slack sends
+// no Retry-After, as the tests do to run fast.
+func (c *Client) WithRetryWait(wait time.Duration) *Client {
+	c.retryWait = wait
 
 	return c
 }
@@ -124,6 +157,8 @@ func (c *Client) createURL(methodName string) string {
 
 // createRequest builds a request for methodName, sent with token unless
 // token is "".
+//
+//declscope:shared
 func (c *Client) createRequest(
 	ctx context.Context,
 	httpMethod string,
@@ -164,4 +199,44 @@ func (c *Client) rotateTokens(ctx context.Context, refreshToken tokens.RefreshTo
 		AppConfigurationTokenExpiresAt: *response.ExpiresAt.Time(),
 		RefreshToken:                   response.RefreshToken,
 	}, nil
+}
+
+// send sends the request newRequest builds, and builds and sends it again
+// after the wait Slack asks for when it answers HTTP 429.
+//
+//declscope:shared
+func (c *Client) send(
+	ctx context.Context,
+	methodName string,
+	newRequest func() (*http.Request, error),
+) (*http.Response, error) {
+	for attempt := 1; ; attempt++ {
+		httpRequest, err := newRequest()
+		if err != nil {
+			return nil, err
+		}
+
+		httpResponse, err := c.httpClient.Do(httpRequest)
+		if err != nil {
+			return nil, err
+		}
+
+		if httpResponse.StatusCode != http.StatusTooManyRequests || attempt == clientMaxAttempts {
+			return httpResponse, nil
+		}
+
+		wait := c.retryWait
+		if seconds, err := strconv.Atoi(httpResponse.Header.Get("Retry-After")); err == nil && seconds >= 0 {
+			wait = time.Duration(seconds) * time.Second
+		}
+		_ = httpResponse.Body.Close()
+
+		tflog.Debug(ctx, "Slack rate-limited the call, waiting", map[string]any{"method": methodName, "wait": wait.String()})
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }

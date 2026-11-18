@@ -36,6 +36,7 @@ import (
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack"
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack/tokens"
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack/tokens/storage"
+	"github.com/ymm-oss/terraform-provider-slackapp/internal/vault"
 )
 
 func configureSlackClient(d Model) (*slack.Client, error) {
@@ -51,9 +52,23 @@ func configureSlackClient(d Model) (*slack.Client, error) {
 	baseURL := stringOrEnvironment(d.BaseURL, "SLACK_BASE_URL")
 	appConfigurationToken := stringOrEnvironment(d.AppConfigurationToken, "SLACK_APP_CONFIGURATION_TOKEN")
 	refreshToken := stringOrEnvironment(d.RefreshToken, "SLACK_REFRESH_TOKEN")
+	serviceToken := stringOrEnvironment(d.ServiceToken, "SLACK_SERVICE_TOKEN")
 
-	if appConfigurationToken == "" && refreshToken == "" && store == nil {
-		return nil, errors.New("either app configuration token, refresh token or token store must be provided")
+	if serviceToken != "" && (appConfigurationToken != "" || refreshToken != "" || store != nil) {
+		return nil, errors.New("a service token is used alone: set it, or the app configuration token, refresh token and token store, not both")
+	}
+
+	if serviceToken == "" && appConfigurationToken == "" && refreshToken == "" && store == nil {
+		return nil, errors.New("either service token, app configuration token, refresh token or token store must be provided")
+	}
+
+	if serviceToken != "" {
+		client := slack.NewClient().WithServiceToken(tokens.AppConfigurationToken(serviceToken))
+		if baseURL != "" {
+			client = client.WithBaseURL(baseURL)
+		}
+
+		return client, nil
 	}
 
 	client := slack.NewClient().
@@ -137,7 +152,10 @@ func requireKnownTokenAttributes(d Model) error {
 	values := map[string]attr.Value{
 		"app_configuration_token": d.AppConfigurationToken,
 		"refresh_token":           d.RefreshToken,
+		"service_token":           d.ServiceToken,
 		"token_store":             d.TokenStore,
+		"vim_client_id":           d.VimClientID,
+		"vim_client_secret":       d.VimClientSecret,
 	}
 	for name, value := range d.TokenStore.Attributes() {
 		values["token_store."+name] = value
@@ -166,6 +184,17 @@ type Model struct {
 	RefreshToken          types.String `tfsdk:"refresh_token"`
 	BaseURL               types.String `tfsdk:"base_url"`
 	TokenStore            types.Object `tfsdk:"token_store"`
+	ServiceToken          types.String `tfsdk:"service_token"`
+	VimClientID           types.String `tfsdk:"vim_client_id"`
+	VimClientSecret       types.String `tfsdk:"vim_client_secret"`
+}
+
+// providerData is what the provider hands its resources and data sources.
+//
+//declscope:shared
+type providerData struct {
+	slack *slack.Client
+	vault *vault.Client
 }
 
 type Provider struct {
@@ -206,6 +235,25 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, response 
 				MarkdownDescription: "Refresh token for the Slack Workspace.",
 				Sensitive:           true,
 				Optional:            true,
+			},
+			"service_token": schema.StringAttribute{
+				MarkdownDescription: "A Slack CLI service token (`slack auth token`), used in place of the app configuration token " +
+					"and refresh token. It does not expire and is never rotated. " +
+					"It also lets `slackapp_vim_app` install apps and set their icons. " +
+					"Can also be set with the `SLACK_SERVICE_TOKEN` environment variable.",
+				Sensitive: true,
+				Optional:  true,
+			},
+			"vim_client_id": schema.StringAttribute{
+				MarkdownDescription: "Client ID of the Vim platform app that `slackapp_vim_app` writes vault secrets as. " +
+					"Can also be set with the `VIM_CLIENT_ID` environment variable.",
+				Optional: true,
+			},
+			"vim_client_secret": schema.StringAttribute{
+				MarkdownDescription: "Client secret of that Vim platform app. " +
+					"Can also be set with the `VIM_CLIENT_SECRET` environment variable.",
+				Sensitive: true,
+				Optional:  true,
 			},
 			"base_url": schema.StringAttribute{
 				MarkdownDescription: "Base URL of the Slack API. Defaults to `https://slack.com/api/`.",
@@ -264,7 +312,13 @@ func (p *Provider) Configure(
 		response.Diagnostics.AddError("Error occurred while configuring the provider.", err.Error())
 	}
 
-	response.ResourceData = client
+	response.ResourceData = &providerData{
+		slack: client,
+		vault: vault.NewClient(
+			stringOrEnvironment(data.VimClientID, "VIM_CLIENT_ID"),
+			stringOrEnvironment(data.VimClientSecret, "VIM_CLIENT_SECRET"),
+		),
+	}
 }
 
 func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource {
@@ -276,5 +330,6 @@ func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource
 func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		newApplicationResource,
+		newVimAppResource,
 	}
 }

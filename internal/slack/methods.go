@@ -3,11 +3,14 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -167,6 +170,12 @@ func (c *Client) ToolingTokensRotate(
 // When Slack refuses the token as expired or revoked, it gets another and
 // calls once more.
 func callMethod[T response](ctx context.Context, c *Client, methodName string, request any) (*T, error) {
+	if c.serviceToken != "" {
+		response, err := callMethodWithToken[T](ctx, c, methodName, c.serviceToken, request)
+
+		return response, explainServiceTokenError(err)
+	}
+
 	token, err := c.tokens.Get(ctx)
 	if err != nil {
 		return nil, err
@@ -194,15 +203,188 @@ func callMethodWithToken[T response](
 	token tokens.AppConfigurationToken,
 	request any,
 ) (*T, error) {
-	httpRequest, err := c.createJSONRequest(ctx, http.MethodPost, methodName, token, request)
-	if err != nil {
-		return nil, err
-	}
-
-	httpResponse, err := c.httpClient.Do(httpRequest)
+	httpResponse, err := c.send(ctx, methodName, func() (*http.Request, error) {
+		return c.createJSONRequest(ctx, http.MethodPost, methodName, token, request)
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	return readJSONResponse[T](ctx, methodName, httpResponse)
+}
+
+// BotToken is an installed app's bot token. It prints as [redacted];
+// string(t) gives the value.
+type BotToken string
+
+func (t BotToken) String() string { return "[redacted]" }
+
+func (t BotToken) GoString() string { return "[redacted]" }
+
+type AppsDeveloperInstallRequest struct {
+	AppID string `json:"app_id"`
+}
+
+type AppsDeveloperInstallResponse struct {
+	Ok              bool `json:"ok"`
+	APIAccessTokens struct {
+		Bot BotToken `json:"bot"`
+	} `json:"api_access_tokens"`
+}
+
+func (r AppsDeveloperInstallResponse) IsOk() bool {
+	return r.Ok
+}
+
+// logFields leaves out APIAccessTokens: they are the app's secrets.
+func (r AppsDeveloperInstallResponse) logFields() map[string]any {
+	return nil
+}
+
+// AppsDeveloperInstall installs the app in the token owner's workspace, and
+// returns its bot token. Installing again returns the same bot token.
+func (c *Client) AppsDeveloperInstall(
+	ctx context.Context,
+	request AppsDeveloperInstallRequest,
+) (*AppsDeveloperInstallResponse, error) {
+	return callMethod[AppsDeveloperInstallResponse](ctx, c, "apps.developerInstall", &request)
+}
+
+type AuthTestResponse struct {
+	Ok     bool   `json:"ok"`
+	TeamID string `json:"team_id"`
+	UserID string `json:"user_id"`
+	BotID  string `json:"bot_id"`
+}
+
+func (r AuthTestResponse) IsOk() bool {
+	return r.Ok
+}
+
+func (r AuthTestResponse) logFields() map[string]any {
+	return map[string]any{"team_id": r.TeamID, "user_id": r.UserID, "bot_id": r.BotID}
+}
+
+// AuthTest names the workspace, user and bot that botToken acts as.
+func (c *Client) AuthTest(ctx context.Context, botToken BotToken) (*AuthTestResponse, error) {
+	return callMethodWithToken[AuthTestResponse](ctx, c, "auth.test", tokens.AppConfigurationToken(botToken), struct{}{})
+}
+
+type BotsInfoRequest struct {
+	Bot string
+}
+
+type BotsInfoResponse struct {
+	Ok  bool `json:"ok"`
+	Bot struct {
+		Icons struct {
+			Image72 string `json:"image_72"`
+		} `json:"icons"`
+	} `json:"bot"`
+}
+
+func (r BotsInfoResponse) IsOk() bool {
+	return r.Ok
+}
+
+func (r BotsInfoResponse) logFields() map[string]any {
+	return nil
+}
+
+// BotsInfo returns a bot's profile, including the URL Slack serves its
+// icon at. The URL changes on every apps.icon.set, even with the same image.
+func (c *Client) BotsInfo(ctx context.Context, request BotsInfoRequest) (*BotsInfoResponse, error) {
+	const methodName = "bots.info"
+
+	values := url.Values{}
+	values.Set("bot", request.Bot)
+
+	return callManagementMethodWith[BotsInfoResponse](ctx, c, methodName, func(token tokens.AppConfigurationToken) (*http.Request, error) {
+		httpRequest, err := c.createRequest(ctx, http.MethodPost, methodName, token, bytes.NewBufferString(values.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		httpRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		return httpRequest, nil
+	})
+}
+
+type AppsIconSetRequest struct {
+	AppID    string
+	FileName string
+	Image    []byte
+}
+
+type AppsIconSetResponse struct {
+	Ok bool `json:"ok"`
+}
+
+func (r AppsIconSetResponse) IsOk() bool {
+	return r.Ok
+}
+
+func (r AppsIconSetResponse) logFields() map[string]any {
+	return nil
+}
+
+// AppsIconSet replaces the app's icon. Slack takes a PNG, JPEG or GIF of 512
+// to 2000 pixels per side, and treats every call as a change.
+func (c *Client) AppsIconSet(ctx context.Context, request AppsIconSetRequest) (*AppsIconSetResponse, error) {
+	const methodName = "apps.icon.set"
+
+	return callManagementMethodWith[AppsIconSetResponse](ctx, c, methodName, func(token tokens.AppConfigurationToken) (*http.Request, error) {
+		var body bytes.Buffer
+		form := multipart.NewWriter(&body)
+		if err := form.WriteField("app_id", request.AppID); err != nil {
+			return nil, err
+		}
+		part, err := form.CreateFormFile("file", filepath.Base(request.FileName))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part.Write(request.Image); err != nil {
+			return nil, err
+		}
+		if err := form.Close(); err != nil {
+			return nil, err
+		}
+
+		httpRequest, err := c.createRequest(ctx, http.MethodPost, methodName, token, &body)
+		if err != nil {
+			return nil, err
+		}
+		httpRequest.Header.Set("Content-Type", form.FormDataContentType())
+
+		return httpRequest, nil
+	})
+}
+
+// callManagementMethodWith calls a method whose body is not JSON, with the
+// token every app management call carries.
+func callManagementMethodWith[T response](
+	ctx context.Context,
+	c *Client,
+	methodName string,
+	newRequest func(token tokens.AppConfigurationToken) (*http.Request, error),
+) (*T, error) {
+	token := c.serviceToken
+	if token == "" {
+		var err error
+		if token, err = c.tokens.Get(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	httpResponse, err := c.send(ctx, methodName, func() (*http.Request, error) { return newRequest(token) })
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := readJSONResponse[T](ctx, methodName, httpResponse)
+	if c.serviceToken != "" {
+		err = explainServiceTokenError(err)
+	}
+
+	return response, err
 }

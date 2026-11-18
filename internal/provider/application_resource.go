@@ -2,12 +2,9 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
-	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -16,7 +13,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
-	"github.com/ymm-oss/terraform-provider-slackapp/internal/manifest"
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/provider/manifesttype"
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/provider/planmodifiers"
 	"github.com/ymm-oss/terraform-provider-slackapp/internal/slack"
@@ -104,17 +100,17 @@ func (r *applicationResource) Configure(
 		return
 	}
 
-	client, ok := request.ProviderData.(*slack.Client)
+	data, ok := request.ProviderData.(*providerData)
 	if !ok {
 		response.Diagnostics.AddError(
 			"The provider is not configured properly.",
-			fmt.Sprintf("request.ProviderData is %T, not *slack.Client", request.ProviderData),
+			fmt.Sprintf("request.ProviderData is %T, not *providerData", request.ProviderData),
 		)
 
 		return
 	}
 
-	r.client = client
+	r.client = data.slack
 }
 
 func (r *applicationResource) Create(ctx context.Context, request resource.CreateRequest, response *resource.CreateResponse) {
@@ -132,7 +128,7 @@ func (r *applicationResource) Create(ctx context.Context, request resource.Creat
 		},
 	)
 	if err != nil {
-		r.handleSlackErrorInDiag(&response.Diagnostics, "create", err)
+		addSlackError(&response.Diagnostics, "create", err)
 
 		return
 	}
@@ -166,25 +162,18 @@ func (r *applicationResource) Read(ctx context.Context, request resource.ReadReq
 		return
 	}
 
-	apiResponse, err := r.client.AppsManifestExport(
-		ctx, slack.AppsManifestExportRequest{
-			AppID: data.ID.ValueString(),
-		},
-	)
-	if slack.IsAppNotFoundError(err) {
+	exported, found := readManifest(ctx, r.client, data.ID.ValueString(), data.Manifest, &response.Diagnostics)
+	if response.Diagnostics.HasError() {
+		return
+	}
+	if !found {
 		// Deleted outside Terraform. Leaving state makes the plan create it
 		// again, with a new ID and new credentials.
-		//
-		// Slack also answers app_not_found when the token cannot see the
-		// app, such as a token for another workspace. The plan would then
-		// create a second app, so this is a warning the plan shows, not
-		// only a log line.
-		tflog.Warn(ctx, "The Slack app no longer exists, removing it from state", map[string]any{"app_id": data.ID.ValueString()})
 		response.Diagnostics.AddWarning(
 			"The Slack app was not found, so it was removed from state",
 			fmt.Sprintf(
 				"Slack answered app_not_found for %s, so the plan creates the app again, with a new app ID and new credentials. "+
-					"If the app still exists, check that the app configuration token is for the workspace that owns it.",
+					"If the app still exists, check that the token is for the workspace that owns it.",
 				data.ID.ValueString(),
 			),
 		)
@@ -192,68 +181,8 @@ func (r *applicationResource) Read(ctx context.Context, request resource.ReadReq
 
 		return
 	}
-	if err != nil {
-		r.handleSlackErrorInDiag(&response.Diagnostics, "read", err)
 
-		return
-	}
-
-	if len(apiResponse.Manifest) == 0 || string(apiResponse.Manifest) == "null" {
-		response.Diagnostics.AddError("Slack API returned empty manifest.", "apps.manifest.export returned ok but no manifest payload")
-		return
-	}
-
-	var exported map[string]json.RawMessage
-	if err := json.Unmarshal(apiResponse.Manifest, &exported); err != nil {
-		response.Diagnostics.AddError("Slack API returned a manifest that is not a JSON object.", err.Error())
-
-		return
-	}
-
-	// Slack drops _metadata from the manifest on applying, so carry it over
-	// from the manifest in state. On import there is none yet.
-	hasLocalManifest := !data.Manifest.IsNull() && !data.Manifest.IsUnknown() && strings.TrimSpace(data.Manifest.ValueString()) != ""
-	if _, ok := exported["_metadata"]; !ok && hasLocalManifest {
-		var local map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(data.Manifest.ValueString()), &local); err != nil {
-			response.Diagnostics.AddAttributeError(
-				path.Root("manifest"),
-				"Manifest must be a valid JSON.",
-				err.Error(),
-			)
-
-			return
-		}
-
-		if metadata, ok := local["_metadata"]; ok {
-			exported["_metadata"] = metadata
-		}
-	}
-
-	// Every field Slack exported is kept, including the ones
-	// the slackapp_manifest data source does not model.
-	manifestJSON, err := json.Marshal(exported)
-	if err != nil {
-		response.Diagnostics.AddError("Failed to re-serialize the JSON manifest.", err.Error())
-
-		return
-	}
-
-	// Slack fills in every setting the manifest did not state. Keep only the
-	// fields the manifest in state has, so those defaults do not show as
-	// drift. On import there is no manifest in state, and all of it is kept.
-	if hasLocalManifest {
-		pruned, err := manifest.PruneToPrior(string(manifestJSON), data.Manifest.ValueString())
-		if err != nil {
-			response.Diagnostics.AddError("Failed to compare the exported manifest with the one in state.", err.Error())
-
-			return
-		}
-
-		manifestJSON = []byte(pruned)
-	}
-
-	data.Manifest = manifesttype.NewManifestValue(string(manifestJSON))
+	data.Manifest = exported
 
 	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
 }
@@ -275,7 +204,7 @@ func (r *applicationResource) Update(ctx context.Context, request resource.Updat
 		},
 	)
 	if err != nil {
-		r.handleSlackErrorInDiag(&response.Diagnostics, "update", err)
+		addSlackError(&response.Diagnostics, "update", err)
 
 		return
 	}
@@ -307,7 +236,7 @@ func (r *applicationResource) Delete(ctx context.Context, request resource.Delet
 		return
 	}
 	if err != nil {
-		r.handleSlackErrorInDiag(&response.Diagnostics, "delete", err)
+		addSlackError(&response.Diagnostics, "delete", err)
 
 		return
 	}
@@ -319,28 +248,4 @@ func (r *applicationResource) ImportState(
 	response *resource.ImportStateResponse,
 ) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), request, response)
-}
-
-// handleSlackErrorInDiag adds err to diagnostics. operation is the verb for
-// what failed: "create", "read", "update" or "delete".
-//
-// When Slack lists what is wrong, each item is its own error under the
-// message Slack gave, and the detail names the operation and where in the
-// manifest the item points. Otherwise the summary names the operation.
-func (r *applicationResource) handleSlackErrorInDiag(diagnostics *diag.Diagnostics, operation string, err error) {
-	summary := "Failed to " + operation + " the Slack app"
-
-	slackErr, ok := err.(*slack.ErrorResponse)
-	if ok && len(slackErr.Errors) > 0 {
-		for _, e := range slackErr.Errors {
-			detail := summary + "."
-			if e.Pointer != "" {
-				detail += " Slack points to " + e.Pointer + " in the manifest."
-			}
-
-			diagnostics.AddError(e.Message, detail)
-		}
-	} else {
-		diagnostics.AddError(summary, err.Error())
-	}
 }

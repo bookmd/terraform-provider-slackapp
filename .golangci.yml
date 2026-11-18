@@ -41,6 +41,7 @@ linters:
           files:
             - "**/internal/slack/**/*.go"
             - "**/internal/manifest/*.go"
+            - "**/internal/vault/*.go"
           allow:
             - github.com/hashicorp/terraform-plugin-log
           deny:

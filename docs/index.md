@@ -19,7 +19,10 @@ description: |-
 - `app_configuration_token` (String, Sensitive) App configuration token for the Slack Workspace.
 - `base_url` (String) Base URL of the Slack API. Defaults to `https://slack.com/api/`.
 - `refresh_token` (String, Sensitive) Refresh token for the Slack Workspace.
+- `service_token` (String, Sensitive) A Slack CLI service token (`slack auth token`), used in place of the app configuration token and refresh token. It does not expire and is never rotated. It also lets `slackapp_vim_app` install apps and set their icons. Can also be set with the `SLACK_SERVICE_TOKEN` environment variable.
 - `token_store` (Attributes) Where to keep the tokens that each rotation of the refresh token returns. Slack voids a refresh token once it is used, so without a store the configured refresh token works for one run only. Set exactly one of `file` and `command`. Can also be set with the `SLACK_TOKEN_STORE_FILE` or `SLACK_TOKEN_STORE_COMMAND` environment variable. (see [below for nested schema](#nestedatt--token_store))
+- `vim_client_id` (String) Client ID of the Vim platform app that `slackapp_vim_app` writes vault secrets as. Can also be set with the `VIM_CLIENT_ID` environment variable.
+- `vim_client_secret` (String, Sensitive) Client secret of that Vim platform app. Can also be set with the `VIM_CLIENT_SECRET` environment variable.
 
 <a id="nestedatt--token_store"></a>
 ### Nested Schema for `token_store`

@@ -629,6 +629,8 @@ func TestAccApplication_refreshFails(t *testing.T) {
 
 // applicationResourceDeleteInSlack deletes app n in the fake through the API,
 // the way someone outside Terraform would.
+//
+//declscope:shared
 func applicationResourceDeleteInSlack(t *testing.T, f *fakeSlack, n int) {
 	t.Helper()
 

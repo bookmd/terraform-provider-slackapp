@@ -26,22 +26,32 @@ type clientCall struct {
 	method        string
 	authorization string
 	userAgent     string
-	contentType   string
-	body          string
+	//declscope:shared
+	contentType string
+	//declscope:shared
+	body string
 }
 
 // clientServer is a Slack API that answers each method with a fixed reply
 // and records what it was sent.
+//
+//declscope:shared
 type clientServer struct {
 	*httptest.Server
 
-	mu      sync.Mutex
+	//declscope:private
+	mu sync.Mutex
+	//declscope:private
 	replies map[string]string
-	calls   []clientCall
+	//declscope:private
+	calls []clientCall
 	// refused maps the tokens the server refuses to the error it answers.
+	//
+	//declscope:private
 	refused map[string]string
 }
 
+//declscope:shared
 func newClientServer(t *testing.T, replies map[string]string) *clientServer {
 	t.Helper()
 
@@ -85,6 +95,8 @@ func (s *clientServer) expire(token string) {
 }
 
 // refuse makes the server answer code to calls sent with token.
+//
+//declscope:shared
 func (s *clientServer) refuse(token, code string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,6 +106,8 @@ func (s *clientServer) refuse(token, code string) {
 
 // methods returns the methods the server received, in order, and the token
 // each was sent with.
+//
+//declscope:shared
 func (s *clientServer) methods() []string {
 	calls := s.recorded()
 
@@ -108,10 +122,12 @@ func (s *clientServer) methods() []string {
 	return methods
 }
 
+//declscope:shared
 func (s *clientServer) client(token tokens.AppConfigurationToken) *slack.Client {
 	return slack.NewClient().WithAppConfigurationToken(token).WithBaseURL(s.URL + "/")
 }
 
+//declscope:shared
 func (s *clientServer) recorded() []clientCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -121,6 +137,8 @@ func (s *clientServer) recorded() []clientCall {
 
 // clientJSONEqual reports whether two JSON documents are equal, ignoring
 // formatting.
+//
+//declscope:shared
 func clientJSONEqual(t *testing.T, got, want string) bool {
 	t.Helper()
 
