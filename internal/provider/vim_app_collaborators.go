@@ -16,6 +16,36 @@ import (
 //declscope:shared // vim_app.go validates the schema's elements with it
 var vimAppCollaboratorsUserIDPattern = regexp.MustCompile(`^[UW][A-Z0-9]{2,}$`)
 
+// vimAppCollaboratorsUnsyncedKey marks, in private state, an apply that did
+// not finish setting the collaborators, so that Read never takes the planned
+// set as applied.
+const vimAppCollaboratorsUnsyncedKey = "collaborators_unsynced"
+
+// vimAppCollaboratorsPrivateState is the private state of a resource, as
+// Create, Read and Update each hand it over.
+//
+//declscope:shared // vim_app.go passes each response's Private
+type vimAppCollaboratorsPrivateState interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+//declscope:shared // vim_app.go records each apply's outcome
+func vimAppCollaboratorsMarkUnsynced(ctx context.Context, private vimAppCollaboratorsPrivateState, unsynced bool, diagnostics *diag.Diagnostics) {
+	value := []byte("false")
+	if unsynced {
+		value = []byte("true")
+	}
+	diagnostics.Append(private.SetKey(ctx, vimAppCollaboratorsUnsyncedKey, value)...)
+}
+
+//declscope:shared // vim_app.go reads it in Read
+func vimAppCollaboratorsUnsynced(ctx context.Context, private vimAppCollaboratorsPrivateState) bool {
+	value, _ := private.GetKey(ctx, vimAppCollaboratorsUnsyncedKey)
+
+	return string(value) == "true"
+}
+
 // vimAppCollaboratorsWanted returns the declared collaborators, sorted, and
 // whether they are declared at all.
 //
@@ -37,7 +67,7 @@ func vimAppCollaboratorsWanted(ctx context.Context, set types.Set, diagnostics *
 // declared: Read leaves it out, and removing it would leave nobody able to
 // manage the app through the token.
 //
-//declscope:shared // vim_app.go checks it before changing anything
+//declscope:shared // vim_app.go checks it at plan and before changing anything
 func (r *vimAppResource) vimAppCollaboratorsTokenOwner(ctx context.Context, wanted []string, diagnostics *diag.Diagnostics) (string, bool) {
 	caller, err := r.slack.AuthTestCaller(ctx)
 	if err != nil {
@@ -57,41 +87,75 @@ func (r *vimAppResource) vimAppCollaboratorsTokenOwner(ctx context.Context, want
 	return caller.UserID, true
 }
 
-// vimAppCollaboratorsRead lists the app's collaborators other than the
-// token's own user, sorted.
+// vimAppCollaboratorsListed is an app's collaborators other than the token's
+// own user, sorted.
+type vimAppCollaboratorsListed struct {
+	owners  []string
+	readers []string
+}
+
+// vimAppCollaboratorsList lists the app's collaborators. A listing without
+// the token's user under the ID auth.test gave is refused: the token could
+// not then be told apart from the people to remove.
+func (r *vimAppResource) vimAppCollaboratorsList(ctx context.Context, appID, tokenOwner string) (vimAppCollaboratorsListed, error) {
+	listed, err := r.slack.DeveloperAppsOwnersList(ctx, slack.DeveloperAppsOwnersListRequest{AppID: appID})
+	if err != nil {
+		return vimAppCollaboratorsListed{}, err
+	}
+
+	var result vimAppCollaboratorsListed
+	tokenOwnerListed := false
+	for _, owner := range listed.Owners {
+		switch {
+		case owner.UserID == tokenOwner:
+			tokenOwnerListed = true
+		case owner.PermissionType == "reader":
+			result.readers = append(result.readers, owner.UserID)
+		default:
+			result.owners = append(result.owners, owner.UserID)
+		}
+	}
+	if !tokenOwnerListed {
+		return vimAppCollaboratorsListed{}, fmt.Errorf("slack does not list %s, the service token's user, among the collaborators "+
+			"of app %s, so it cannot be told apart from the others; nothing is changed", tokenOwner, appID)
+	}
+	slices.Sort(result.owners)
+	slices.Sort(result.readers)
+
+	return result, nil
+}
+
+// vimAppCollaboratorsRead returns the app's collaborators with owner access,
+// the token's own user left out.
 //
 //declscope:shared // vim_app.go reads drift with it
 func (r *vimAppResource) vimAppCollaboratorsRead(ctx context.Context, appID, tokenOwner string) ([]string, error) {
-	listed, err := r.slack.DeveloperAppsOwnersList(ctx, slack.DeveloperAppsOwnersListRequest{AppID: appID})
-	if err != nil {
-		return nil, err
-	}
+	listed, err := r.vimAppCollaboratorsList(ctx, appID, tokenOwner)
 
-	collaborators := []string{}
-	for _, owner := range listed.Owners {
-		if owner.UserID != tokenOwner {
-			collaborators = append(collaborators, owner.UserID)
-		}
-	}
-	slices.Sort(collaborators)
-
-	return collaborators, nil
+	return listed.owners, err
 }
 
-// vimAppCollaboratorsApply adds the wanted collaborators the app lacks, then
-// removes the ones not wanted. Adding first never leaves the app with fewer
-// people able to manage it.
+// vimAppCollaboratorsApply makes wanted the app's owners besides the token's
+// user. It adds before it removes, so the app never has fewer people able to
+// manage it than both sets share.
 //
 //declscope:shared // vim_app.go applies the declared collaborators with it
 func (r *vimAppResource) vimAppCollaboratorsApply(ctx context.Context, appID, tokenOwner string, wanted []string) error {
-	current, err := r.vimAppCollaboratorsRead(ctx, appID, tokenOwner)
+	listed, err := r.vimAppCollaboratorsList(ctx, appID, tokenOwner)
 	if err != nil {
 		return fmt.Errorf("listing them: %w", err)
 	}
 
 	for _, user := range wanted {
-		if slices.Contains(current, user) {
+		if slices.Contains(listed.owners, user) {
 			continue
+		}
+		// Slack does not say how adding a reader as owner answers, so the
+		// reader is removed first.
+		if slices.Contains(listed.readers, user) {
+			if err := r.vimAppCollaboratorsRemove(ctx, appID, user); err != nil {
+				return err
+			}
 		}
 		_, err := r.slack.DeveloperAppsOwnersAdd(ctx, slack.DeveloperAppsOwnersChangeRequest{AppID: appID, UserID: user})
 		if err != nil && !slack.IsAlreadyOwnerError(err) {
@@ -99,13 +163,24 @@ func (r *vimAppResource) vimAppCollaboratorsApply(ctx context.Context, appID, to
 		}
 	}
 
-	for _, user := range current {
+	for _, user := range slices.Concat(listed.owners, listed.readers) {
 		if slices.Contains(wanted, user) {
 			continue
 		}
-		if _, err := r.slack.DeveloperAppsOwnersRemove(ctx, slack.DeveloperAppsOwnersChangeRequest{AppID: appID, UserID: user}); err != nil {
-			return fmt.Errorf("removing %s: %w", user, err)
+		if err := r.vimAppCollaboratorsRemove(ctx, appID, user); err != nil {
+			return err
 		}
+	}
+
+	return nil
+}
+
+// vimAppCollaboratorsRemove removes a collaborator who is not the token's
+// user; vimAppCollaboratorsList leaves that user out of every set it returns.
+func (r *vimAppResource) vimAppCollaboratorsRemove(ctx context.Context, appID, user string) error {
+	_, err := r.slack.DeveloperAppsOwnersRemove(ctx, slack.DeveloperAppsOwnersChangeRequest{AppID: appID, UserID: user})
+	if err != nil && !slack.IsUserNotFoundError(err) {
+		return fmt.Errorf("removing %s: %w", user, err)
 	}
 
 	return nil

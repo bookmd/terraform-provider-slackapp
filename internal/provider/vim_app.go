@@ -249,6 +249,13 @@ func (r *vimAppResource) ModifyPlan(ctx context.Context, request resource.Modify
 	creating := request.State.Raw.IsNull()
 	appGone := !creating && state.ID.IsNull()
 
+	if collaborators, managed := vimAppCollaboratorsWanted(ctx, plan.Collaborators, &response.Diagnostics); managed && r.slack != nil &&
+		len(collaborators) > 0 && !plan.Collaborators.Equal(state.Collaborators) {
+		if _, ok := r.vimAppCollaboratorsTokenOwner(ctx, collaborators, &response.Diagnostics); !ok {
+			return
+		}
+	}
+
 	switch {
 	case plan.IconPath.IsUnknown():
 		plan.IconSHA256 = types.StringUnknown()
@@ -497,9 +504,11 @@ func (r *vimAppResource) Create(ctx context.Context, request resource.CreateRequ
 	if managed {
 		// A warning, not an error: an error would taint the app, and replacing
 		// it fails on the vault secret it leaves. The next Read shows the gap.
-		if err := r.vimAppCollaboratorsApply(ctx, data.ID.ValueString(), tokenOwner, collaborators); err != nil {
+		err := r.vimAppCollaboratorsApply(ctx, data.ID.ValueString(), tokenOwner, collaborators)
+		if err != nil {
 			response.Diagnostics.AddWarning("Failed to set the Slack app's collaborators", "The next plan sets them again: "+err.Error())
 		}
+		vimAppCollaboratorsMarkUnsynced(ctx, response.Private, err != nil, &response.Diagnostics)
 	}
 
 	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
@@ -534,7 +543,7 @@ func (r *vimAppResource) Read(ctx context.Context, request resource.ReadRequest,
 	}
 
 	data.Manifest = exported
-	r.readCollaborators(ctx, &data, &response.Diagnostics)
+	r.readCollaborators(ctx, &data, response.Private, &response.Diagnostics)
 
 	if !data.IconImageURL.IsNull() && !data.BotID.IsNull() {
 		info, err := r.slack.BotsInfo(ctx, slack.BotsInfoRequest{Bot: data.BotID.ValueString()})
@@ -553,7 +562,12 @@ func (r *vimAppResource) Read(ctx context.Context, request resource.ReadRequest,
 
 // readCollaborators records the app's collaborators, when they are declared,
 // so that one added or removed in Slack shows as drift.
-func (r *vimAppResource) readCollaborators(ctx context.Context, data *vimAppResourceModel, diagnostics *diag.Diagnostics) {
+func (r *vimAppResource) readCollaborators(
+	ctx context.Context,
+	data *vimAppResourceModel,
+	private vimAppCollaboratorsPrivateState,
+	diagnostics *diag.Diagnostics,
+) {
 	if data.Collaborators.IsNull() {
 		return
 	}
@@ -566,11 +580,16 @@ func (r *vimAppResource) readCollaborators(ctx context.Context, data *vimAppReso
 	if err != nil {
 		diagnostics.AddWarning("Failed to read the Slack app's collaborators",
 			"A change to them in Slack is not detected: "+err.Error())
+		if vimAppCollaboratorsUnsynced(ctx, private) {
+			// The last apply did not set them, so state may claim people who were never added.
+			data.Collaborators = types.SetNull(types.StringType)
+		}
 
 		return
 	}
 
 	data.Collaborators = vimAppCollaboratorsSet(collaborators)
+	vimAppCollaboratorsMarkUnsynced(ctx, private, false, diagnostics)
 }
 
 func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequest, response *resource.UpdateResponse) {
@@ -615,10 +634,13 @@ func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequ
 	}
 
 	if managed {
-		if err := r.vimAppCollaboratorsApply(ctx, plan.ID.ValueString(), tokenOwner, collaborators); err != nil {
-			// The next Read records which changes took effect.
+		err := r.vimAppCollaboratorsApply(ctx, plan.ID.ValueString(), tokenOwner, collaborators)
+		if err != nil {
 			response.Diagnostics.AddError("Failed to set the Slack app's collaborators", err.Error())
+			// Null, so that the next plan applies them again whatever Read finds.
+			plan.Collaborators = types.SetNull(types.StringType)
 		}
+		vimAppCollaboratorsMarkUnsynced(ctx, response.Private, err != nil, &response.Diagnostics)
 	}
 
 	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)

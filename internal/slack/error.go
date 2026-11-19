@@ -39,6 +39,14 @@ func IsAlreadyOwnerError(err error) bool {
 	return errors.As(err, &slackErr) && slackErr.Error_ == "user_already_owner"
 }
 
+// IsUserNotFoundError reports whether err, or an error it wraps, is Slack
+// answering user_not_found.
+func IsUserNotFoundError(err error) bool {
+	var slackErr *ErrorResponse
+
+	return errors.As(err, &slackErr) && slackErr.Error_ == "user_not_found"
+}
+
 // isTokenRefusedError reports whether err, or an error it wraps, is Slack
 // refusing the app configuration token in a way another token cures:
 // token_expired after its 12 hours, or token_revoked once a rotation

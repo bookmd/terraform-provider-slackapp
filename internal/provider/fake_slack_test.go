@@ -52,7 +52,15 @@ type fakeSlack struct {
 	//declscope:private
 	team string
 	//declscope:private
-	owners map[string][]string
+	owners map[string][]fakeSlackOwner
+	//declscope:private
+	tokenOwnerListedAs string
+}
+
+// fakeSlackOwner is one collaborator of an app.
+type fakeSlackOwner struct {
+	user       string
+	permission string
 }
 
 // fakeSlackTokenOwner is the user the service token acts as, and so the
@@ -83,7 +91,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		installs:          map[string]int{},
 		icons:             map[string][]string{},
 		team:              "T1",
-		owners:            map[string][]string{},
+		owners:            map[string][]fakeSlackOwner{},
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(f.server.Close)
@@ -365,7 +373,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.nextID++
 		appID := fakeSlackAppID(f.nextID)
 		f.apps[appID] = json.RawMessage(body.Manifest)
-		f.owners[appID] = []string{fakeSlackTokenOwner}
+		f.owners[appID] = []fakeSlackOwner{{user: fakeSlackTokenOwner, permission: "owner"}}
 		f.reply(w, map[string]any{
 			"ok":     true,
 			"app_id": appID,
@@ -505,7 +513,7 @@ func (f *fakeSlack) serveForm(w http.ResponseWriter, r *http.Request, method str
 }
 
 // serveOwners answers developer.apps.owners.*. Like Slack, it refuses to
-// add a collaborator twice or to remove the last one.
+// add a collaborator twice, a reader included, or to remove the last one.
 func (f *fakeSlack) serveOwners(w http.ResponseWriter, r *http.Request, method string) {
 	appID, user := r.PostFormValue("app_id"), r.PostFormValue("user_id")
 	owners, ok := f.owners[appID]
@@ -514,29 +522,30 @@ func (f *fakeSlack) serveOwners(w http.ResponseWriter, r *http.Request, method s
 
 		return
 	}
+	i := slices.IndexFunc(owners, func(o fakeSlackOwner) bool { return o.user == user })
 
 	switch method {
 	case "developer.apps.owners.list":
 		listed := []map[string]string{}
 		for _, owner := range owners {
-			listed = append(listed, map[string]string{"user_id": owner, "username": "name-" + owner, "permission_type": "owner"})
+			id := owner.user
+			if id == fakeSlackTokenOwner && f.tokenOwnerListedAs != "" {
+				id = f.tokenOwnerListedAs
+			}
+			listed = append(listed, map[string]string{"user_id": id, "username": "name-" + id, "permission_type": owner.permission})
 		}
 		f.reply(w, map[string]any{"ok": true, "owners": listed})
 	case "developer.apps.owners.add":
-		if slices.Contains(owners, user) {
+		switch {
+		case i >= 0:
 			f.reply(w, map[string]any{"ok": false, "error": "user_already_owner"})
-
-			return
-		}
-		if r.PostFormValue("permission_type") != "owner" {
+		case r.PostFormValue("permission_type") != "owner":
 			f.reply(w, map[string]any{"ok": false, "error": "invalid_permission_type"})
-
-			return
+		default:
+			f.owners[appID] = append(owners, fakeSlackOwner{user: user, permission: "owner"})
+			f.reply(w, map[string]any{"ok": true})
 		}
-		f.owners[appID] = append(owners, user)
-		f.reply(w, map[string]any{"ok": true})
 	default:
-		i := slices.Index(owners, user)
 		switch {
 		case i < 0:
 			f.reply(w, map[string]any{"ok": false, "error": "user_not_found"})
@@ -550,27 +559,42 @@ func (f *fakeSlack) serveOwners(w http.ResponseWriter, r *http.Request, method s
 }
 
 // collaborators returns the app's collaborators, the token's user included,
-// sorted.
+// sorted, each `<user>:<permission>`.
 //
 //declscope:shared // vim_app_test.go checks Slack through it
 func (f *fakeSlack) collaborators(appID string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	owners := slices.Clone(f.owners[appID])
-	slices.Sort(owners)
+	listed := []string{}
+	for _, owner := range f.owners[appID] {
+		listed = append(listed, owner.user+":"+owner.permission)
+	}
+	slices.Sort(listed)
 
-	return owners
+	return listed
 }
 
-// addCollaborator adds a collaborator, as someone would in Slack's settings.
+// addCollaborator adds a collaborator with permission, as someone would in
+// Slack's settings.
 //
 //declscope:shared // vim_app_test.go checks the change shows as drift
-func (f *fakeSlack) addCollaborator(appID, user string) {
+func (f *fakeSlack) addCollaborator(appID, user, permission string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.owners[appID] = append(f.owners[appID], user)
+	f.owners[appID] = append(f.owners[appID], fakeSlackOwner{user: user, permission: permission})
+}
+
+// listTokenOwnerAs makes developer.apps.owners.list give the token's user
+// another ID than auth.test does.
+//
+//declscope:shared // vim_app_test.go checks the token's user is then never removed
+func (f *fakeSlack) listTokenOwnerAs(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.tokenOwnerListedAs = id
 }
 
 // iconsSet returns the SHA-256 of each image set as the app's icon, in order.

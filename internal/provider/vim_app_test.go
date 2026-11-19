@@ -39,9 +39,11 @@ func (c vimAppConfig) hcl(slack *fakeSlack, vim *fakeVim) string {
 	if c.icon != "" {
 		icon = fmt.Sprintf("%q", c.icon)
 	}
-	collaborators := "null"
+	// Left out, not null, when unset: a provider older than the attribute
+	// refuses it even null.
+	collaborators := ""
 	if c.collaborators != nil {
-		collaborators = hclList(c.collaborators)
+		collaborators = "collaborators = " + hclList(c.collaborators)
 	}
 	vimBaseURL := vim.baseURL()
 	if c.vimBaseURL != "" {
@@ -67,7 +69,7 @@ resource "slackapp_vim_app" "test" {
   vim_account_id    = "acc-1"
   vault_secret_name = "slack-app/test"
   vault_consumers   = %s
-  collaborators     = %s
+  %s
 }
 `, slack.baseURL(), c.name, c.name, hclList(c.scopes), icon, vimBaseURL, hclList(c.consumers), collaborators)
 }
@@ -556,10 +558,13 @@ func TestAccVimApp_recreateInAnotherWorkspace(t *testing.T) {
 }
 
 // vimAppCheckCollaborators checks the app in state has the token's user and
-// want as its collaborators in Slack.
+// want as its owners in Slack, and nobody else.
 func vimAppCheckCollaborators(slack *fakeSlack, want ...string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
-		all := append([]string{fakeSlackTokenOwner}, want...)
+		all := []string{fakeSlackTokenOwner + ":owner"}
+		for _, user := range want {
+			all = append(all, user+":owner")
+		}
 		slices.Sort(all)
 		appID := s.RootModule().Resources[vimAppResource].Primary.ID
 		if got := slack.collaborators(appID); !slices.Equal(got, all) {
@@ -568,6 +573,10 @@ func vimAppCheckCollaborators(slack *fakeSlack, want ...string) resource.TestChe
 
 		return nil
 	}
+}
+
+func vimAppExpectUpdate() []plancheck.PlanCheck {
+	return []plancheck.PlanCheck{plancheck.ExpectResourceAction(vimAppResource, plancheck.ResourceActionUpdate)}
 }
 
 // Collaborators are added and removed to match the declared set, the token's
@@ -602,16 +611,57 @@ func TestAccVimApp_collaborators(t *testing.T) {
 				),
 			},
 			{
-				PreConfig: func() { slack.addCollaborator(appID, "U009") },
-				Config:    swapped.hcl(slack, vim),
-				ConfigPlanChecks: resource.ConfigPlanChecks{
-					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(vimAppResource, plancheck.ResourceActionUpdate)},
-				},
-				Check: vimAppCheckCollaborators(slack, "U002", "W003"),
+				PreConfig:        func() { slack.addCollaborator(appID, "U009", "owner") },
+				Config:           swapped.hcl(slack, vim),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: vimAppExpectUpdate()},
+				Check:            vimAppCheckCollaborators(slack, "U002", "W003"),
 			},
 			{
 				Config: none.hcl(slack, vim),
 				Check:  vimAppCheckCollaborators(slack),
+			},
+		},
+	})
+}
+
+// Declaring collaborators on an app that had none adds them, and unsetting
+// the attribute stops managing them, leaving Slack as it is.
+func TestAccVimApp_collaboratorsAddedThenUnset(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	unset := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}}
+	declared := unset
+	declared.collaborators = []string{"U001"}
+	listed := 0
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: unset.hcl(slack, vim)},
+			{
+				Config:           declared.hcl(slack, vim),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: vimAppExpectUpdate()},
+				Check:            vimAppCheckCollaborators(slack, "U001"),
+			},
+			{
+				Config: unset.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(vimAppResource, "collaborators.#"),
+					vimAppCheckCollaborators(slack, "U001"),
+				),
+			},
+			{
+				PreConfig: func() {
+					slack.addCollaborator(fakeSlackAppID(1), "U009", "owner")
+					listed = slack.callCount("developer.apps.owners.list")
+				},
+				Config: unset.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vimAppCheckCollaborators(slack, "U001", "U009"),
+					func(*terraform.State) error {
+						return vimAppCheckCalls(slack, "developer.apps.owners.list", listed)(nil)
+					},
+				),
 			},
 		},
 	})
@@ -628,10 +678,10 @@ func TestAccVimApp_collaboratorsUnset(t *testing.T) {
 		Steps: []resource.TestStep{
 			{Config: config.hcl(slack, vim)},
 			{
-				PreConfig: func() { slack.addCollaborator(fakeSlackAppID(1), "U009") },
+				PreConfig: func() { slack.addCollaborator(fakeSlackAppID(1), "U009", "owner") },
 				Config:    config.hcl(slack, vim),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckNoResourceAttr(vimAppResource, "collaborators"),
+					resource.TestCheckNoResourceAttr(vimAppResource, "collaborators.#"),
 					vimAppCheckCollaborators(slack, "U009"),
 					vimAppCheckCalls(slack, "developer.apps.owners.list", 0),
 				),
@@ -640,8 +690,41 @@ func TestAccVimApp_collaboratorsUnset(t *testing.T) {
 	})
 }
 
-// The token's user owns the app, so declaring it is refused before anything
-// is created.
+// An app applied by 0.5.0, which has no collaborators, plans no change under
+// this provider.
+func TestAccVimApp_collaboratorsUpgradeFrom050(t *testing.T) {
+	providerUnsetEnvironment(t)
+	// The released provider and this one must share an address for the
+	// second step to plan against the first one's state.
+	t.Setenv("TF_ACC_PROVIDER_NAMESPACE", "bookmd")
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, consumers: []string{"agentflow:staging/jim"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				ExternalProviders: map[string]resource.ExternalProvider{
+					"slackapp": {Source: "bookmd/slackapp", VersionConstraint: "0.5.0-bookmd.1"},
+				},
+				Config: config.hcl(slack, vim),
+			},
+			{
+				ProtoV6ProviderFactories: providerFactories,
+				Config: `
+terraform {
+  required_providers {
+    slackapp = { source = "bookmd/slackapp" }
+  }
+}
+` + config.hcl(slack, vim),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// The token's user owns the app, so declaring it is refused at plan, before
+// anything is created.
 func TestAccVimApp_collaboratorIsTokenOwner(t *testing.T) {
 	providerUnsetEnvironment(t)
 	slack, vim := newFakeSlack(t), newFakeVim(t)
@@ -651,6 +734,7 @@ func TestAccVimApp_collaboratorIsTokenOwner(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config:      vimAppConfig{name: "Jim", collaborators: []string{fakeSlackTokenOwner}}.hcl(slack, vim),
+				PlanOnly:    true,
 				ExpectError: regexp.MustCompile(`A collaborator is the service token's user`),
 			},
 		},
@@ -661,23 +745,8 @@ func TestAccVimApp_collaboratorIsTokenOwner(t *testing.T) {
 	}
 }
 
-func TestAccVimApp_collaboratorNotAUserID(t *testing.T) {
-	providerUnsetEnvironment(t)
-	slack, vim := newFakeSlack(t), newFakeVim(t)
-
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: providerFactories,
-		Steps: []resource.TestStep{
-			{
-				Config:      vimAppConfig{name: "Jim", collaborators: []string{"someone@example.com"}}.hcl(slack, vim),
-				PlanOnly:    true,
-				ExpectError: regexp.MustCompile(`must\s+be\s+a\s+Slack\s+user\s+ID`),
-			},
-		},
-	})
-}
-
-// Declaring the token's user on an existing app changes nothing.
+// Declaring the token's user on an existing app is refused at plan, and
+// changes nothing.
 func TestAccVimApp_collaboratorIsTokenOwnerOnUpdate(t *testing.T) {
 	providerUnsetEnvironment(t)
 	slack, vim := newFakeSlack(t), newFakeVim(t)
@@ -692,6 +761,7 @@ func TestAccVimApp_collaboratorIsTokenOwnerOnUpdate(t *testing.T) {
 			{Config: config.hcl(slack, vim)},
 			{
 				Config:      owner.hcl(slack, vim),
+				PlanOnly:    true,
 				ExpectError: regexp.MustCompile(`A collaborator is the service token's user`),
 			},
 			{
@@ -705,12 +775,72 @@ func TestAccVimApp_collaboratorIsTokenOwnerOnUpdate(t *testing.T) {
 	})
 }
 
-// A collaborator Slack refuses keeps the app, and the next plan adds it
-// again.
+// When Slack lists the token's user under another ID than auth.test gives,
+// as an Enterprise Grid W ID beside a U ID could, nothing is removed and the
+// listing is not recorded.
+func TestAccVimApp_collaboratorsTokenOwnerNotListed(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+	swapped := config
+	swapped.collaborators = []string{"U002"}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(slack, vim)},
+			{
+				PreConfig:   func() { slack.listTokenOwnerAs("W0TOKENOWNER") },
+				Config:      swapped.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`does\s+not\s+list\s+UTOKENOWNER`),
+			},
+			{
+				PreConfig: func() {
+					got, want := slack.collaborators(fakeSlackAppID(1)), []string{"U001:owner", fakeSlackTokenOwner + ":owner"}
+					if !slices.Equal(got, want) {
+						t.Errorf("Slack has collaborators %v, want %v", got, want)
+					}
+					if slack.callCount("developer.apps.owners.remove") != 0 {
+						t.Error("a collaborator was removed while the token's user was not listed")
+					}
+				},
+				Config:      swapped.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`does\s+not\s+list\s+UTOKENOWNER`),
+			},
+		},
+	})
+}
+
+// A wanted reader is made an owner, and a reader not wanted is removed.
+func TestAccVimApp_collaboratorsReaders(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	appID := fakeSlackAppID(1)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{}}.hcl(slack, vim)},
+			{
+				PreConfig: func() {
+					slack.addCollaborator(appID, "U001", "reader")
+					slack.addCollaborator(appID, "U009", "reader")
+				},
+				Config:           config.hcl(slack, vim),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: vimAppExpectUpdate()},
+				Check:            vimAppCheckCollaborators(slack, "U001"),
+			},
+		},
+	})
+}
+
+// A failed add on create keeps the app, and the next plan adds the
+// collaborator again.
 func TestAccVimApp_collaboratorsFail(t *testing.T) {
 	providerUnsetEnvironment(t)
 	slack, vim := newFakeSlack(t), newFakeVim(t)
-	slack.failWith("developer.apps.owners.add", map[string]any{"ok": false, "error": "user_not_found"})
+	slack.failWith("developer.apps.owners.add", map[string]any{"ok": false, "error": "invalid_user"})
 	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
 
 	resource.UnitTest(t, resource.TestCase{
@@ -732,6 +862,117 @@ func TestAccVimApp_collaboratorsFail(t *testing.T) {
 					resource.TestCheckResourceAttr(vimAppResource, "id", fakeSlackAppID(1)),
 					vimAppCheckCollaborators(slack, "U001"),
 				),
+			},
+		},
+	})
+}
+
+// When create fails to set the collaborators and the next Read cannot list
+// them, the plan still shows them to set, rather than taking them as set.
+func TestAccVimApp_collaboratorsFailThenListFails(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	slack.failWith("developer.apps.owners.list", map[string]any{"ok": false, "error": "internal_error"})
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:             config.hcl(slack, vim),
+				ExpectNonEmptyPlan: true,
+				ConfigPlanChecks:   resource.ConfigPlanChecks{PostApplyPostRefresh: vimAppExpectUpdate()},
+				Check:              vimAppCheckCollaborators(slack),
+			},
+			{
+				PreConfig: func() { slack.succeed("developer.apps.owners.list") },
+				Config:    config.hcl(slack, vim),
+				Check:     vimAppCheckCollaborators(slack, "U001"),
+			},
+		},
+	})
+}
+
+// A failed update leaves the collaborators to set again, even when the next
+// Read cannot list them.
+func TestAccVimApp_collaboratorsUpdateFails(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+	swapped := config
+	swapped.collaborators = []string{"U002"}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(slack, vim)},
+			{
+				PreConfig: func() {
+					slack.failWith("developer.apps.owners.add", map[string]any{"ok": false, "error": "invalid_user"})
+				},
+				Config:      swapped.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`Failed to set the Slack app's collaborators`),
+			},
+			{
+				PreConfig: func() {
+					slack.succeed("developer.apps.owners.add")
+					slack.failWith("developer.apps.owners.list", map[string]any{"ok": false, "error": "internal_error"})
+				},
+				Config:             swapped.hcl(slack, vim),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				PreConfig: func() { slack.succeed("developer.apps.owners.list") },
+				Config:    swapped.hcl(slack, vim),
+				Check:     vimAppCheckCollaborators(slack, "U002"),
+			},
+		},
+	})
+}
+
+// A collaborator already gone when removed counts as removed, and Slack
+// refusing to remove the last owner fails the apply.
+func TestAccVimApp_collaboratorsRemoveAnswers(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+	none := config
+	none.collaborators = []string{}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(slack, vim)},
+			{
+				PreConfig: func() {
+					slack.failWith("developer.apps.owners.remove", map[string]any{"ok": false, "error": "user_not_found"})
+				},
+				Config:             none.hcl(slack, vim),
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				PreConfig: func() {
+					slack.failWith("developer.apps.owners.remove", map[string]any{"ok": false, "error": "cannot_abandon_app"})
+				},
+				Config:      none.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`cannot_abandon_app`),
+			},
+		},
+	})
+}
+
+func TestAccVimApp_collaboratorNotAUserID(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      vimAppConfig{name: "Jim", collaborators: []string{"someone@example.com"}}.hcl(slack, vim),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`must\s+be\s+a\s+Slack\s+user\s+ID`),
 			},
 		},
 	})
