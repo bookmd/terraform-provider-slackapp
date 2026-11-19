@@ -299,15 +299,96 @@ func (c *Client) BotsInfo(ctx context.Context, request BotsInfoRequest) (*BotsIn
 	values := url.Values{}
 	values.Set("bot", request.Bot)
 
-	return callManagementMethodWith[BotsInfoResponse](ctx, c, methodName, func(token tokens.AppConfigurationToken) (*http.Request, error) {
-		httpRequest, err := c.createRequest(ctx, http.MethodPost, methodName, token, bytes.NewBufferString(values.Encode()))
-		if err != nil {
-			return nil, err
-		}
-		httpRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return callManagementForm[BotsInfoResponse](ctx, c, methodName, values)
+}
 
-		return httpRequest, nil
-	})
+// AuthTestCaller names the workspace and user that the client's own token
+// acts as.
+func (c *Client) AuthTestCaller(ctx context.Context) (*AuthTestResponse, error) {
+	return callMethod[AuthTestResponse](ctx, c, "auth.test", struct{}{})
+}
+
+// DeveloperAppsOwner is one collaborator of an app.
+type DeveloperAppsOwner struct {
+	UserID         string `json:"user_id"`
+	PermissionType string `json:"permission_type"`
+}
+
+// developerAppsOwnerPermission is the access a collaborator is given: owner
+// lets them manage the app, where reader only lets them see it.
+const developerAppsOwnerPermission = "owner"
+
+type DeveloperAppsOwnersListRequest struct {
+	AppID string
+}
+
+type DeveloperAppsOwnersListResponse struct {
+	Ok     bool                 `json:"ok"`
+	Owners []DeveloperAppsOwner `json:"owners"`
+}
+
+func (r DeveloperAppsOwnersListResponse) IsOk() bool {
+	return r.Ok
+}
+
+func (r DeveloperAppsOwnersListResponse) logFields() map[string]any {
+	return map[string]any{"owners": len(r.Owners)}
+}
+
+// DeveloperAppsOwnersList lists an app's collaborators, the token's own
+// user included. Only a collaborator of the app may call it.
+func (c *Client) DeveloperAppsOwnersList(
+	ctx context.Context,
+	request DeveloperAppsOwnersListRequest,
+) (*DeveloperAppsOwnersListResponse, error) {
+	values := url.Values{}
+	values.Set("app_id", request.AppID)
+
+	return callManagementForm[DeveloperAppsOwnersListResponse](ctx, c, "developer.apps.owners.list", values)
+}
+
+type DeveloperAppsOwnersChangeRequest struct {
+	AppID  string
+	UserID string
+}
+
+type DeveloperAppsOwnersChangeResponse struct {
+	Ok bool `json:"ok"`
+}
+
+func (r DeveloperAppsOwnersChangeResponse) IsOk() bool {
+	return r.Ok
+}
+
+func (r DeveloperAppsOwnersChangeResponse) logFields() map[string]any {
+	return nil
+}
+
+// DeveloperAppsOwnersAdd makes a user a collaborator of the app, as owner. A user who already is one is refused with
+// user_already_owner.
+func (c *Client) DeveloperAppsOwnersAdd(
+	ctx context.Context,
+	request DeveloperAppsOwnersChangeRequest,
+) (*DeveloperAppsOwnersChangeResponse, error) {
+	values := url.Values{}
+	values.Set("app_id", request.AppID)
+	values.Set("user_id", request.UserID)
+	values.Set("permission_type", developerAppsOwnerPermission)
+
+	return callManagementForm[DeveloperAppsOwnersChangeResponse](ctx, c, "developer.apps.owners.add", values)
+}
+
+// DeveloperAppsOwnersRemove removes a collaborator from the app. Slack
+// refuses to remove the last one.
+func (c *Client) DeveloperAppsOwnersRemove(
+	ctx context.Context,
+	request DeveloperAppsOwnersChangeRequest,
+) (*DeveloperAppsOwnersChangeResponse, error) {
+	values := url.Values{}
+	values.Set("app_id", request.AppID)
+	values.Set("user_id", request.UserID)
+
+	return callManagementForm[DeveloperAppsOwnersChangeResponse](ctx, c, "developer.apps.owners.remove", values)
 }
 
 type AppsIconSetRequest struct {
@@ -355,6 +436,20 @@ func (c *Client) AppsIconSet(ctx context.Context, request AppsIconSetRequest) (*
 			return nil, err
 		}
 		httpRequest.Header.Set("Content-Type", form.FormDataContentType())
+
+		return httpRequest, nil
+	})
+}
+
+// callManagementForm calls a method that takes a form, with the token every
+// app management call carries.
+func callManagementForm[T response](ctx context.Context, c *Client, methodName string, values url.Values) (*T, error) {
+	return callManagementMethodWith[T](ctx, c, methodName, func(token tokens.AppConfigurationToken) (*http.Request, error) {
+		httpRequest, err := c.createRequest(ctx, http.MethodPost, methodName, token, bytes.NewBufferString(values.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		httpRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		return httpRequest, nil
 	})

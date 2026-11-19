@@ -27,6 +27,7 @@ Destroy deletes the app but not the vault secret, since the Vim platform app may
 
 ### Optional
 
+- `collaborators` (Set of String) Slack user IDs, such as `U0123ABCD`, of the people who may manage the app at https://api.slack.com/apps, beside the service token's user, who owns it and is never listed. Each is added as an owner, and a collaborator not listed is removed, including one added in Slack. Unset, the provider leaves the collaborators as they are.
 - `icon_path` (String) Path of the app icon: a PNG, JPEG or GIF of 512 to 2000 pixels per side. It is set when its contents change, judged by `icon_sha256`.
 - `vault_consumers` (Set of String) The services that may reveal the secret, each `<service>:<name>`.
 
