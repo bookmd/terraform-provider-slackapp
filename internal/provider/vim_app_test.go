@@ -28,6 +28,8 @@ type vimAppConfig struct {
 	scopes    []string
 	icon      string
 	consumers []string
+	// collaborators is left unset when nil.
+	collaborators []string
 	// vimBaseURL replaces the fake Vim's URL.
 	vimBaseURL string
 }
@@ -36,6 +38,10 @@ func (c vimAppConfig) hcl(slack *fakeSlack, vim *fakeVim) string {
 	icon := "null"
 	if c.icon != "" {
 		icon = fmt.Sprintf("%q", c.icon)
+	}
+	collaborators := "null"
+	if c.collaborators != nil {
+		collaborators = hclList(c.collaborators)
 	}
 	vimBaseURL := vim.baseURL()
 	if c.vimBaseURL != "" {
@@ -61,8 +67,9 @@ resource "slackapp_vim_app" "test" {
   vim_account_id    = "acc-1"
   vault_secret_name = "slack-app/test"
   vault_consumers   = %s
+  collaborators     = %s
 }
-`, slack.baseURL(), c.name, c.name, hclList(c.scopes), icon, vimBaseURL, hclList(c.consumers))
+`, slack.baseURL(), c.name, c.name, hclList(c.scopes), icon, vimBaseURL, hclList(c.consumers), collaborators)
 }
 
 func hclList(values []string) string {
@@ -546,4 +553,186 @@ func TestAccVimApp_recreateInAnotherWorkspace(t *testing.T) {
 	if _, secret := vim.secret("slack-app/test"); secret == nil || secret.fields["botToken"] != fakeSlackBotToken(fakeSlackAppID(1)) {
 		t.Error("the vault secret no longer holds the original app's credentials")
 	}
+}
+
+// vimAppCheckCollaborators checks the app in state has the token's user and
+// want as its collaborators in Slack.
+func vimAppCheckCollaborators(slack *fakeSlack, want ...string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		all := append([]string{fakeSlackTokenOwner}, want...)
+		slices.Sort(all)
+		appID := s.RootModule().Resources[vimAppResource].Primary.ID
+		if got := slack.collaborators(appID); !slices.Equal(got, all) {
+			return fmt.Errorf("Slack has collaborators %v, want %v", got, all)
+		}
+
+		return nil
+	}
+}
+
+// Collaborators are added and removed to match the declared set, the token's
+// user is kept and never listed, and one added in Slack shows as drift.
+func TestAccVimApp_collaborators(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	appID := fakeSlackAppID(1)
+
+	one := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+	swapped := one
+	swapped.collaborators = []string{"U002", "W003"}
+	none := one
+	none.collaborators = []string{}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: one.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(vimAppResource, "collaborators.#", "1"),
+					resource.TestCheckTypeSetElemAttr(vimAppResource, "collaborators.*", "U001"),
+					vimAppCheckCollaborators(slack, "U001"),
+				),
+			},
+			{
+				Config: swapped.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vimAppCheckCollaborators(slack, "U002", "W003"),
+					vimAppCheckCalls(slack, "apps.manifest.update", 0),
+				),
+			},
+			{
+				PreConfig: func() { slack.addCollaborator(appID, "U009") },
+				Config:    swapped.hcl(slack, vim),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(vimAppResource, plancheck.ResourceActionUpdate)},
+				},
+				Check: vimAppCheckCollaborators(slack, "U002", "W003"),
+			},
+			{
+				Config: none.hcl(slack, vim),
+				Check:  vimAppCheckCollaborators(slack),
+			},
+		},
+	})
+}
+
+// Unset, collaborators are left as they are and never listed.
+func TestAccVimApp_collaboratorsUnset(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(slack, vim)},
+			{
+				PreConfig: func() { slack.addCollaborator(fakeSlackAppID(1), "U009") },
+				Config:    config.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(vimAppResource, "collaborators"),
+					vimAppCheckCollaborators(slack, "U009"),
+					vimAppCheckCalls(slack, "developer.apps.owners.list", 0),
+				),
+			},
+		},
+	})
+}
+
+// The token's user owns the app, so declaring it is refused before anything
+// is created.
+func TestAccVimApp_collaboratorIsTokenOwner(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      vimAppConfig{name: "Jim", collaborators: []string{fakeSlackTokenOwner}}.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`A collaborator is the service token's user`),
+			},
+		},
+	})
+
+	if slack.appCount() != 0 {
+		t.Error("an app was created with the token's user declared as a collaborator")
+	}
+}
+
+func TestAccVimApp_collaboratorNotAUserID(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      vimAppConfig{name: "Jim", collaborators: []string{"someone@example.com"}}.hcl(slack, vim),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`must\s+be\s+a\s+Slack\s+user\s+ID`),
+			},
+		},
+	})
+}
+
+// Declaring the token's user on an existing app changes nothing.
+func TestAccVimApp_collaboratorIsTokenOwnerOnUpdate(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+	owner := config
+	owner.name = "Jim Two"
+	owner.collaborators = []string{"U001", fakeSlackTokenOwner}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{Config: config.hcl(slack, vim)},
+			{
+				Config:      owner.hcl(slack, vim),
+				ExpectError: regexp.MustCompile(`A collaborator is the service token's user`),
+			},
+			{
+				Config: config.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vimAppCheckCalls(slack, "apps.manifest.update", 0),
+					vimAppCheckCollaborators(slack, "U001"),
+				),
+			},
+		},
+	})
+}
+
+// A collaborator Slack refuses keeps the app, and the next plan adds it
+// again.
+func TestAccVimApp_collaboratorsFail(t *testing.T) {
+	providerUnsetEnvironment(t)
+	slack, vim := newFakeSlack(t), newFakeVim(t)
+	slack.failWith("developer.apps.owners.add", map[string]any{"ok": false, "error": "user_not_found"})
+	config := vimAppConfig{name: "Jim", scopes: []string{"chat:write"}, collaborators: []string{"U001"}}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:             config.hcl(slack, vim),
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(vimAppResource, "id", fakeSlackAppID(1)),
+					vimAppCheckSecret(vim, 1),
+					vimAppCheckCollaborators(slack),
+				),
+			},
+			{
+				PreConfig: func() { slack.succeed("developer.apps.owners.add") },
+				Config:    config.hcl(slack, vim),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(vimAppResource, "id", fakeSlackAppID(1)),
+					vimAppCheckCollaborators(slack, "U001"),
+				),
+			},
+		},
+	})
 }

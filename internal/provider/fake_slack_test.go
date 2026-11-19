@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +51,15 @@ type fakeSlack struct {
 	iconSets int
 	//declscope:private
 	team string
+	//declscope:private
+	owners map[string][]string
 }
+
+// fakeSlackTokenOwner is the user the service token acts as, and so the
+// first collaborator of every app it creates.
+//
+//declscope:shared // vim_app_test.go checks it is never listed
+const fakeSlackTokenOwner = "UTOKENOWNER"
 
 // fakeSlackAppID is the ID the fake gives the nth app it creates, counting
 // from 1, so that a test can name an app before it exists.
@@ -74,6 +83,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		installs:          map[string]int{},
 		icons:             map[string][]string{},
 		team:              "T1",
+		owners:            map[string][]string{},
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(f.server.Close)
@@ -322,7 +332,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// These methods take a form, not JSON.
-	if method == "apps.icon.set" || method == "bots.info" {
+	if method == "apps.icon.set" || method == "bots.info" || strings.HasPrefix(method, "developer.apps.owners.") {
 		f.serveForm(w, r, method)
 
 		return
@@ -355,6 +365,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.nextID++
 		appID := fakeSlackAppID(f.nextID)
 		f.apps[appID] = json.RawMessage(body.Manifest)
+		f.owners[appID] = []string{fakeSlackTokenOwner}
 		f.reply(w, map[string]any{
 			"ok":     true,
 			"app_id": appID,
@@ -401,7 +412,13 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.installs[body.AppID]++
 		f.reply(w, map[string]any{"ok": true, "api_access_tokens": map[string]any{"bot": fakeSlackBotToken(body.AppID)}})
 	case "auth.test":
-		appID := strings.TrimPrefix(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), "xoxb-")
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if strings.HasPrefix(token, "xoxp-") {
+			f.reply(w, map[string]any{"ok": true, "team_id": f.team, "user_id": fakeSlackTokenOwner})
+
+			return
+		}
+		appID := strings.TrimPrefix(token, "xoxb-")
 		f.reply(w, map[string]any{"ok": true, "team_id": f.team, "user_id": "U" + appID, "bot_id": "B" + appID})
 	case "apps.manifest.delete":
 		if _, ok := f.apps[body.AppID]; !ok {
@@ -410,6 +427,7 @@ func (f *fakeSlack) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		delete(f.apps, body.AppID)
+		delete(f.owners, body.AppID)
 		f.reply(w, map[string]any{"ok": true})
 	default:
 		f.reply(w, map[string]any{"ok": false, "error": "unknown_method"})
@@ -464,6 +482,8 @@ func (f *fakeSlack) serveForm(w http.ResponseWriter, r *http.Request, method str
 	}
 
 	switch method {
+	case "developer.apps.owners.list", "developer.apps.owners.add", "developer.apps.owners.remove":
+		f.serveOwners(w, r, method)
 	case "apps.icon.set":
 		file, _, err := r.FormFile("file")
 		if err != nil {
@@ -482,6 +502,75 @@ func (f *fakeSlack) serveForm(w http.ResponseWriter, r *http.Request, method str
 			"image_72": fmt.Sprintf("https://icons.example/%s/%d.png", appID, f.iconSets),
 		}}})
 	}
+}
+
+// serveOwners answers developer.apps.owners.*. Like Slack, it refuses to
+// add a collaborator twice or to remove the last one.
+func (f *fakeSlack) serveOwners(w http.ResponseWriter, r *http.Request, method string) {
+	appID, user := r.PostFormValue("app_id"), r.PostFormValue("user_id")
+	owners, ok := f.owners[appID]
+	if !ok {
+		f.reply(w, map[string]any{"ok": false, "error": "app_not_found"})
+
+		return
+	}
+
+	switch method {
+	case "developer.apps.owners.list":
+		listed := []map[string]string{}
+		for _, owner := range owners {
+			listed = append(listed, map[string]string{"user_id": owner, "username": "name-" + owner, "permission_type": "owner"})
+		}
+		f.reply(w, map[string]any{"ok": true, "owners": listed})
+	case "developer.apps.owners.add":
+		if slices.Contains(owners, user) {
+			f.reply(w, map[string]any{"ok": false, "error": "user_already_owner"})
+
+			return
+		}
+		if r.PostFormValue("permission_type") != "owner" {
+			f.reply(w, map[string]any{"ok": false, "error": "invalid_permission_type"})
+
+			return
+		}
+		f.owners[appID] = append(owners, user)
+		f.reply(w, map[string]any{"ok": true})
+	default:
+		i := slices.Index(owners, user)
+		switch {
+		case i < 0:
+			f.reply(w, map[string]any{"ok": false, "error": "user_not_found"})
+		case len(owners) == 1:
+			f.reply(w, map[string]any{"ok": false, "error": "cannot_abandon_app"})
+		default:
+			f.owners[appID] = slices.Delete(owners, i, i+1)
+			f.reply(w, map[string]any{"ok": true})
+		}
+	}
+}
+
+// collaborators returns the app's collaborators, the token's user included,
+// sorted.
+//
+//declscope:shared // vim_app_test.go checks Slack through it
+func (f *fakeSlack) collaborators(appID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	owners := slices.Clone(f.owners[appID])
+	slices.Sort(owners)
+
+	return owners
+}
+
+// addCollaborator adds a collaborator, as someone would in Slack's settings.
+//
+//declscope:shared // vim_app_test.go checks the change shows as drift
+func (f *fakeSlack) addCollaborator(appID, user string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.owners[appID] = append(f.owners[appID], user)
 }
 
 // iconsSet returns the SHA-256 of each image set as the app's icon, in order.

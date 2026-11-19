@@ -254,3 +254,65 @@ func TestClientInstallLogsNoSecrets(t *testing.T) {
 		t.Errorf("bot token prints as %q", s)
 	}
 }
+
+func TestClientCollaboratorMethods(t *testing.T) {
+	t.Parallel()
+
+	s := newClientServer(t, map[string]string{
+		"auth.test":                    `{"ok":true,"team_id":"T1","user_id":"UOWNER"}`,
+		"developer.apps.owners.list":   `{"ok":true,"owners":[{"user_id":"UOWNER","username":"owner","permission_type":"owner"},{"user_id":"U1","username":"one"}]}`,
+		"developer.apps.owners.add":    `{"ok":false,"error":"user_already_owner"}`,
+		"developer.apps.owners.remove": `{"ok":true}`,
+	})
+	c := s.serviceClient("xoxp-service")
+	ctx := t.Context()
+
+	caller, err := c.AuthTestCaller(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caller.UserID != "UOWNER" {
+		t.Errorf("auth.test gave user %q", caller.UserID)
+	}
+
+	listed, err := c.DeveloperAppsOwnersList(ctx, slack.DeveloperAppsOwnersListRequest{AppID: "A1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Owners) != 2 || listed.Owners[1].UserID != "U1" || listed.Owners[0].PermissionType != "owner" {
+		t.Errorf("list gave %+v", listed.Owners)
+	}
+
+	_, err = c.DeveloperAppsOwnersAdd(ctx, slack.DeveloperAppsOwnersChangeRequest{AppID: "A1", UserID: "U1"})
+	if !slack.IsAlreadyOwnerError(err) {
+		t.Errorf("add returned %v, want user_already_owner", err)
+	}
+
+	if _, err := c.DeveloperAppsOwnersRemove(ctx, slack.DeveloperAppsOwnersChangeRequest{AppID: "A1", UserID: "U1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"auth.test(xoxp-service)",
+		"developer.apps.owners.list(xoxp-service)",
+		"developer.apps.owners.add(xoxp-service)",
+		"developer.apps.owners.remove(xoxp-service)",
+	}
+	if got := s.methods(); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("calls %v, want %v", got, want)
+	}
+
+	wantForms := []url.Values{
+		{"app_id": {"A1"}},
+		{"app_id": {"A1"}, "user_id": {"U1"}, "permission_type": {"owner"}},
+		{"app_id": {"A1"}, "user_id": {"U1"}},
+	}
+	calls := s.recorded()
+	for i, want := range wantForms {
+		call := calls[i+1]
+		form, err := url.ParseQuery(call.body)
+		if err != nil || call.contentType != "application/x-www-form-urlencoded" || form.Encode() != want.Encode() {
+			t.Errorf("call %d sent %q as %q, want %q", i+2, call.body, call.contentType, want.Encode())
+		}
+	}
+}

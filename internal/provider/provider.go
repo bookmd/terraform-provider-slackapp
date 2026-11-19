@@ -239,7 +239,7 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, response 
 			"service_token": schema.StringAttribute{
 				MarkdownDescription: "A Slack CLI service token (`slack auth token`), used in place of the app configuration token " +
 					"and refresh token. It does not expire and is never rotated. " +
-					"It also lets `slackapp_vim_app` install apps and set their icons. " +
+					"It also lets `slackapp_vim_app` install apps, set their icons and manage their collaborators. " +
 					"Can also be set with the `SLACK_SERVICE_TOKEN` environment variable.",
 				Sensitive: true,
 				Optional:  true,

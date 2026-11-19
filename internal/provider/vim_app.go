@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -49,6 +50,7 @@ type vimAppResourceModel struct {
 	VimAccountID    types.String          `tfsdk:"vim_account_id"`
 	VaultSecretName types.String          `tfsdk:"vault_secret_name"`
 	VaultConsumers  types.Set             `tfsdk:"vault_consumers"`
+	Collaborators   types.Set             `tfsdk:"collaborators"`
 
 	ID               types.String `tfsdk:"id"`
 	TeamID           types.String `tfsdk:"team_id"`
@@ -139,6 +141,16 @@ func (r *vimAppResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional:            true,
 				Computed:            true,
 				Default:             setdefault.StaticValue(types.SetValueMust(types.StringType, nil)),
+			},
+			"collaborators": schema.SetAttribute{
+				MarkdownDescription: "Slack user IDs, such as `U0123ABCD`, of the people who may manage the app at " +
+					"https://api.slack.com/apps, beside the service token's user, who owns it and is never listed. " +
+					"Each is added as an owner, and a collaborator not listed is removed, including one added in Slack. " +
+					"Unset, the provider leaves the collaborators as they are.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Validators: []validator.Set{setvalidator.ValueStringsAre(stringvalidator.RegexMatches(
+					vimAppCollaboratorsUserIDPattern, "must be a Slack user ID, such as U0123ABCD"))},
 			},
 			"id": schema.StringAttribute{
 				MarkdownDescription: "The app ID.",
@@ -428,8 +440,16 @@ func (r *vimAppResource) Create(ctx context.Context, request resource.CreateRequ
 	var data vimAppResourceModel
 	response.Diagnostics.Append(request.Plan.Get(ctx, &data)...)
 	consumers := data.consumers(ctx, &response.Diagnostics)
+	collaborators, managed := vimAppCollaboratorsWanted(ctx, data.Collaborators, &response.Diagnostics)
 	if response.Diagnostics.HasError() {
 		return
+	}
+
+	var tokenOwner string
+	if managed {
+		if tokenOwner, managed = r.vimAppCollaboratorsTokenOwner(ctx, collaborators, &response.Diagnostics); !managed {
+			return
+		}
 	}
 
 	app, ok := r.createAndInstall(ctx, data.Manifest.ValueString(), &response.Diagnostics)
@@ -474,6 +494,14 @@ func (r *vimAppResource) Create(ctx context.Context, request resource.CreateRequ
 	app.apply(&data)
 	r.setIcon(ctx, &data, &response.Diagnostics)
 
+	if managed {
+		// A warning, not an error: an error would taint the app, and replacing
+		// it fails on the vault secret it leaves. The next Read shows the gap.
+		if err := r.vimAppCollaboratorsApply(ctx, data.ID.ValueString(), tokenOwner, collaborators); err != nil {
+			response.Diagnostics.AddWarning("Failed to set the Slack app's collaborators", "The next plan sets them again: "+err.Error())
+		}
+	}
+
 	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
 }
 
@@ -506,6 +534,7 @@ func (r *vimAppResource) Read(ctx context.Context, request resource.ReadRequest,
 	}
 
 	data.Manifest = exported
+	r.readCollaborators(ctx, &data, &response.Diagnostics)
 
 	if !data.IconImageURL.IsNull() && !data.BotID.IsNull() {
 		info, err := r.slack.BotsInfo(ctx, slack.BotsInfoRequest{Bot: data.BotID.ValueString()})
@@ -522,15 +551,50 @@ func (r *vimAppResource) Read(ctx context.Context, request resource.ReadRequest,
 	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
 }
 
+// readCollaborators records the app's collaborators, when they are declared,
+// so that one added or removed in Slack shows as drift.
+func (r *vimAppResource) readCollaborators(ctx context.Context, data *vimAppResourceModel, diagnostics *diag.Diagnostics) {
+	if data.Collaborators.IsNull() {
+		return
+	}
+
+	caller, err := r.slack.AuthTestCaller(ctx)
+	var collaborators []string
+	if err == nil {
+		collaborators, err = r.vimAppCollaboratorsRead(ctx, data.ID.ValueString(), caller.UserID)
+	}
+	if err != nil {
+		diagnostics.AddWarning("Failed to read the Slack app's collaborators",
+			"A change to them in Slack is not detected: "+err.Error())
+
+		return
+	}
+
+	data.Collaborators = vimAppCollaboratorsSet(collaborators)
+}
+
 func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequest, response *resource.UpdateResponse) {
 	var state, plan vimAppResourceModel
 	response.Diagnostics.Append(request.State.Get(ctx, &state)...)
 	response.Diagnostics.Append(request.Plan.Get(ctx, &plan)...)
+	collaborators, managed := vimAppCollaboratorsWanted(ctx, plan.Collaborators, &response.Diagnostics)
 	if response.Diagnostics.HasError() {
 		return
 	}
 
-	if state.ID.IsNull() {
+	recreating := state.ID.IsNull()
+	var tokenOwner string
+	if managed && (recreating || !plan.Collaborators.Equal(state.Collaborators)) {
+		if tokenOwner, managed = r.vimAppCollaboratorsTokenOwner(ctx, collaborators, &response.Diagnostics); !managed {
+			response.Diagnostics.Append(response.State.Set(ctx, &state)...)
+
+			return
+		}
+	} else {
+		managed = false
+	}
+
+	if recreating {
 		r.recreate(ctx, &plan, state.TeamID.ValueString(), &response.Diagnostics)
 	} else {
 		r.updateInPlace(ctx, state, &plan, &response.Diagnostics)
@@ -547,6 +611,13 @@ func (r *vimAppResource) Update(ctx context.Context, request resource.UpdateRequ
 		if _, err := r.vault.SetConsumers(ctx, plan.target(), plan.VaultSecretToken.ValueString(), consumers); err != nil {
 			response.Diagnostics.AddError("Failed to set the services the vault secret is shared with", err.Error())
 			plan.VaultConsumers = state.VaultConsumers
+		}
+	}
+
+	if managed {
+		if err := r.vimAppCollaboratorsApply(ctx, plan.ID.ValueString(), tokenOwner, collaborators); err != nil {
+			// The next Read records which changes took effect.
+			response.Diagnostics.AddError("Failed to set the Slack app's collaborators", err.Error())
 		}
 	}
 
